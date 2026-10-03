@@ -1,4 +1,5 @@
 """Self-checks for the decision engine, classifier, and DeepSWE label derivation. Stdlib unittest."""
+import json as _json
 import os
 import sys
 import tempfile
@@ -6,7 +7,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from model_router.catalog import Model, tier_of_ref
+from model_router.catalog import AA_INDICES_CACHE, Model, apply_tier_ranking, load_aa_indices, rank_candidates, tier_of_ref
 from model_router.classify import Classifier
 from model_router.deepswe import labels
 from model_router.engine import Router, RunStore
@@ -231,6 +232,36 @@ class LabelsTests(unittest.TestCase):
         # p/unknown not in any tier list and not in catalog -> conservative frontier
         out = labels([{"id": "t1"}], [self.trial("t1", "unknown", True)], lambda ref: None)
         self.assertEqual(out["t1"], "frontier")
+
+
+class RankingTests(unittest.TestCase):
+    def test_value_ranking_quality_per_cost(self):
+        models = make_models()
+        quality = {"p/u1": 0.1, "p/u2": 0.8}
+        costs = {"p/u1": 0.1, "p/u2": 0.5}
+        refs = [ref for ref, _c, _q in rank_candidates(["p/u1", "p/u2"], models, quality, costs)]
+        self.assertEqual(refs, ["p/u2", "p/u1"])  # 1.6 vs 1.0 value
+
+    def test_unmeasured_sinks_and_config_untouched(self):
+        models = make_models()
+        quality = {"p/u1": 0.1, "p/u2": 0.8}
+        costs = {"p/u1": 0.1, "p/u2": 0.5}
+        ranked = apply_tier_ranking(CONFIG, models, quality, costs)
+        self.assertEqual(ranked["tiers"]["utility"]["models"][0], "p/u2")
+        self.assertEqual(CONFIG["tiers"]["utility"]["models"], ["p/u1", "p/u2"])
+        ghost = _json.loads(_json.dumps(CONFIG))
+        ghost["tiers"]["utility"]["models"].append("p/ghost")
+        ranked2 = apply_tier_ranking(ghost, models, quality, costs)
+        self.assertEqual(ranked2["tiers"]["utility"]["models"][-1], "p/ghost")
+
+
+class AaCacheTests(unittest.TestCase):
+    def test_cached_indices_returned_without_key(self):
+        with tempfile.TemporaryDirectory() as td:
+            data = {"gpt6": {"intelligence": 50.0}}
+            with open(os.path.join(td, AA_INDICES_CACHE), "w", encoding="utf-8") as f:
+                _json.dump(data, f)
+            self.assertEqual(load_aa_indices(td), data)
 
 
 if __name__ == "__main__":

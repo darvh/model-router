@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -138,16 +139,24 @@ def _collect_indices(obj, out: Dict[str, Dict[str, float]], name_hint: Optional[
             _collect_indices(v, out, name_hint=name_hint)
 
 
-def load_aa_indices(cache_dir: str, api_key: Optional[str] = None, force: bool = False) -> Dict[str, Dict[str, float]]:
+def load_aa_indices(
+    cache_dir: str,
+    api_key: Optional[str] = None,
+    force: bool = False,
+    max_age_hours: float = 168.0,
+) -> Dict[str, Dict[str, float]]:
     """Artificial Analysis index scores keyed by normalized model name.
 
-    Requires AA_API_KEY (free tier). Without a key, returns whatever was cached before
-    (possibly empty) - cost-only ranking still works.
+    Requires AA_API_KEY (free tier). Cached for a week by default - AA updates
+    roughly weekly and the free tier is 100 req/day. Without a key, returns the
+    cached copy (possibly empty); cost-only ranking still works.
     """
     indices_path = os.path.join(cache_dir, AA_INDICES_CACHE)
     cached = read_json(indices_path)
-    if cached is not None and not force:
-        return cached
+    if not force and cached is not None:
+        age_hours = (time.time() - os.path.getmtime(indices_path)) / 3600.0
+        if age_hours < max_age_hours:
+            return cached
     key = api_key or os.environ.get("AA_API_KEY")
     if not key:
         return cached or {}
@@ -196,22 +205,47 @@ def rank_candidates(
     refs: List[str],
     models: Dict[str, Model],
     quality: Optional[Dict[str, float]] = None,
+    costs: Optional[Dict[str, float]] = None,
 ) -> List[Tuple[str, float, Optional[float]]]:
-    """Rank candidate refs by quality/cost value. Returns [(ref, blended_cost, quality)].
+    """Rank candidate refs by quality/cost value. Returns [(ref, cost, quality)].
 
-    quality: optional ref -> 0..1 score (e.g. DeepSWE pass rate, AA normalized index).
-    Without quality, sorts by cost ascending.
+    quality: optional ref -> score (e.g. DeepSWE pass rate)
+    costs:   optional ref -> cost override (e.g. measured $/task); else blended token price
+    Without quality, sorts by cost ascending; unmeasured refs (quality None) sink to the end.
     """
     quality = quality or {}
+    costs = costs or {}
     rows = []
     for ref in refs:
         m = models.get(ref)
         if not m:
             continue
         q = quality.get(ref)
-        rows.append((ref, m.blended_cost, q))
+        c = costs.get(ref)
+        rows.append((ref, float(c) if c is not None else m.blended_cost, q))
     if any(q is not None for _, _, q in rows):
         rows.sort(key=lambda r: (-(r[2] or 0.0) / max(r[1], 1e-9), r[1]))
     else:
         rows.sort(key=lambda r: r[1])
     return rows
+
+
+def apply_tier_ranking(
+    config: dict,
+    models: Dict[str, Model],
+    quality: Optional[Dict[str, float]] = None,
+    costs: Optional[Dict[str, float]] = None,
+) -> dict:
+    """Deep-copied config with each tier's models reordered by measured value.
+
+    Refs missing from the catalog keep their authored order at the end, so nothing is lost.
+    """
+    import copy
+
+    cfg = copy.deepcopy(config)
+    for _tier, spec in cfg.get("tiers", {}).items():
+        refs = list(spec.get("models") or [])
+        ranked = [ref for ref, _c, _q in rank_candidates(refs, models, quality, costs)]
+        missing = [ref for ref in refs if ref not in models]
+        spec["models"] = ranked + missing
+    return cfg

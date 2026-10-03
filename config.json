@@ -36,6 +36,9 @@
     "utility": 1.5,
     "balanced": 15.0
   },
+  "ranking": {
+    "mode": "value"
+  },
   "decision": {
     "rule": "expected_cost",
     "confidence_cap": 0.9,

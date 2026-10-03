@@ -12,7 +12,43 @@ model, and the run's instruction stack. It never calls a model and never execute
   (113 tasks, 31,617 trials).
 - **Costs** from [models.dev](https://models.dev) (open, no key). Optional
   [Artificial Analysis](https://artificialanalysis.ai/data-api) free key adds benchmark
-  indices (100 req/day); without it, quality signal comes from DeepSWE outcomes.
+  indices (100 req/day, cached 7 days); without it, quality signal comes from DeepSWE outcomes.
+
+## How it works
+
+```mermaid
+flowchart LR
+    subgraph Evidence["evidence loop (offline)"]
+        MD["models.dev costs"] --> RK["value ranking<br/>pass rate / $ per task"]
+        DW["DeepSWE trials<br/>113 tasks, 31.6k runs"] --> LB["labels: cheapest<br/>sufficient tier"]
+        DW --> RK
+    end
+
+    subgraph Engine["decision engine (per run, never calls a model)"]
+        T["task text"] --> CL["classifier<br/>TF-IDF + logreg"]
+        LB --> CL
+        CL -->|tier probs| X{"expected-cost rule<br/>confidence-capped"}
+        RK -->|reordered tier models| X
+        X --> D["decision (sticky):<br/>model + advisor + instruction stack"]
+        D --> H["Hall / Line executes it"]
+        H -->|"prior_failure, verification_divergence"| ES["escalate one tier"]
+        ES --> D
+        H -->|complete| Z["close run"]
+    end
+```
+
+Short version:
+
+1. `calibrate` labels each DeepSWE task with the cheapest tier that reliably solved
+   it; those labels train the classifier.
+2. `ranking.mode: "value"` reorders each tier by measured pass rate / measured $ per
+   task (unmeasured models keep place; `"config"` disables).
+3. `route` classifies the task, the expected-cost rule picks the start tier, and the
+   run locks (sticky).
+4. Every decision returns model + advisor + accumulating instruction stack; the caller
+   executes.
+5. Failures escalate one tier and flag advisor review; `complete` ends the run.
+6. `evaluate` replays held-out tasks as policies and reports $ per verified success.
 
 ## Quickstart
 
@@ -93,15 +129,19 @@ cost / mean pass rate.
 |---|---|---|---|
 | always-utility | $0.10 | 39.7% | **0.25** |
 | always-balanced | $2.09 | 63.9% | 3.27 |
-| always-frontier | $3.84 | 60.7% | 6.32 |
-| balanced→frontier | $3.43 | 76.1% | 4.51 |
-| utility→balanced→frontier | $2.32 | 80.5% | 2.88 |
-| **router (this engine)** | **$2.32** | **80.5%** | **2.88** |
+| always-frontier | $4.02 | 59.6% | 6.74 |
+| balanced→frontier | $3.54 | 75.6% | 4.69 |
+| utility→balanced→frontier | $2.42 | 79.5% | 3.04 |
+| **router (this engine)** | **$2.42** | **79.5%** | **3.04** |
 
 Findings, honestly:
 
 - The tier **ladder** is where the value is: cheap first attempts + escalation give both
   lower cost and higher success than any single-tier policy.
+- **Dynamic ranking** drives tier order from the evidence: deepseek-v4-flash leads
+  utility (53% @ $0.10/task), gemini-3.8-flash balanced, gpt-6-astra frontier. Even so
+  the router ties the best ladder policy ($3.04 per verified success); frontier picks
+  sit within noise on 34 held-out tasks (astra vs gpt-5.6-sol differ by ~1pp).
 - The text classifier alone is weak on DeepSWE (65.5% CV vs 85% majority baseline,
   labels: 96 utility / 17 balanced / 0 frontier). Its raw probabilities are overconfident,
   so `decision.confidence_cap` (0.9) prevents starts above utility unless the classifier is
@@ -118,6 +158,7 @@ Findings, honestly:
 {
   "tiers":      { "<tier>": { "models": [...], "directive": "..." } },
   "advisor":    { "<tier>": "auto" | "<provider/model>" },
+  "ranking":    { "mode": "value" | "config" },        // value = order by measured pass/$ 
   "cost_bands": { "utility": 1.5, "balanced": 15.0 },   // $/M output -> tier fallback
   "decision":   { "rule": "expected_cost", "confidence_cap": 0.9,
                   "tier_costs": { "utility": 0.1, "balanced": 1.8, "frontier": 3.84 } },

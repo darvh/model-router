@@ -19,6 +19,7 @@ from collections import Counter
 from . import __version__
 from ._net import read_json
 from .catalog import (
+    apply_tier_ranking,
     build_model_index,
     load_aa_indices,
     load_models,
@@ -68,6 +69,20 @@ def make_ref_of(models):
         )
 
     return ref_of
+
+
+def _apply_ranking(cfg, models, cache_dir):
+    """Reorder tier models by measured value when ranking.mode == 'value' and trials exist."""
+    mode = (cfg.get("ranking") or {}).get("mode") or "config"
+    if mode != "value":
+        return cfg
+    cached = read_json(os.path.join(cache_dir, "deepswe", DEFAULT_VERSION, "trials.json"))
+    if not cached:
+        return cfg
+    stats = model_stats(cached["rows"], ref_of=make_ref_of(models))
+    quality = {ref: s["pass_rate"] for ref, s in stats.items() if s.get("pass_rate") is not None}
+    costs = {ref: s["avg_cost_usd"] for ref, s in stats.items() if s.get("avg_cost_usd") is not None}
+    return apply_tier_ranking(cfg, models, quality, costs)
 
 
 def cmd_refresh(args) -> None:
@@ -124,6 +139,7 @@ def cmd_calibrate(args) -> None:
 def cmd_evaluate(args) -> None:
     cfg = load_config(args.config)
     models = load_models(args.cache_dir)
+    cfg = _apply_ranking(cfg, models, args.cache_dir)
     tasks = fetch_tasks(args.cache_dir)
     trials = fetch_trials(args.cache_dir)
     ids = [t["id"] for t in tasks]
@@ -288,6 +304,7 @@ def cmd_evaluate(args) -> None:
 def cmd_route(args) -> None:
     cfg = load_config(args.config)
     models = load_models(args.cache_dir)
+    cfg = _apply_ranking(cfg, models, args.cache_dir)
     clf = load_classifier(args.cache_dir)
     store = RunStore(os.path.join(args.cache_dir, "runs"))
     router = Router(cfg, models, clf, store)
