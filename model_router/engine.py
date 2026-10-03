@@ -81,6 +81,7 @@ class Decision:
     escalated: bool
     escalation_count: int
     estimated_cost_usd: float
+    latency: Dict
     sticky: bool
     closed: bool
     instructions: List[str]
@@ -163,6 +164,7 @@ class Router:
         efforts: Optional[Dict[str, str]] = None,
         costs: Optional[Dict[str, float]] = None,
         outcomes: Optional[Dict[str, dict]] = None,
+        latency: Optional[Dict[str, dict]] = None,
     ):
         self.config = config
         self.models = models or {}
@@ -175,6 +177,7 @@ class Router:
         # Mutated in place by record_outcome so callers can persist the same dict.
         self.outcomes = outcomes if outcomes is not None else {}
         self.prior_weight = float((config.get("outcomes") or {}).get("prior_weight", 5.0))
+        self.latency = dict(latency or {})  # ref -> median performance metrics (AA)
         self.efforts = dict(DEFAULT_EFFORTS)
         self.efforts.update(efforts or {})
         self.efforts.update(config.get("efforts") or {})  # config wins over defaults/injected
@@ -300,6 +303,7 @@ class Router:
             escalated=state.escalated,
             escalation_count=state.escalation_count,
             estimated_cost_usd=self._expected_chain_cost(state.ladder_index),
+            latency=dict(self.latency.get(model, {})),
             sticky=not state.closed,
             closed=state.closed,
             instructions=stack,
@@ -518,6 +522,7 @@ class Router:
                     escalated=False,
                     escalation_count=0,
                     estimated_cost_usd=0.0,
+                    latency={},
                     sticky=False,
                     closed=True,
                     instructions=[base] if base else [],

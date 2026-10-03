@@ -316,6 +316,29 @@ class EngineTests(unittest.TestCase):
         r = Router(CONFIG, make_models(), classifier=StubClassifier("balanced"))
         self.assertGreater(r.decide("rb3", "x").estimated_cost_usd, 0.0)
 
+    def test_latency_reported(self):
+        r = Router(
+            CONFIG, make_models(), classifier=StubClassifier("balanced"),
+            latency={"p/u1": {"median_time_to_first_token_seconds": 1.5}},
+        )
+        d = r.decide("rl1", "x")
+        self.assertEqual(d.latency["median_time_to_first_token_seconds"], 1.5)
+
+    def test_performance_extraction(self):
+        from model_router.catalog import performance_from_entry
+
+        entry = {
+            "performance": {
+                "median_time_to_first_token_seconds": 15.31,
+                "median_output_tokens_per_second": 239.12,
+                "notes": "x",
+            }
+        }
+        perf = performance_from_entry(entry)
+        self.assertEqual(perf["median_time_to_first_token_seconds"], 15.31)
+        self.assertNotIn("notes", perf)
+        self.assertEqual(performance_from_entry(None), {})
+
     def test_escalation_caps_at_top(self):
         r = Router(CONFIG, make_models(), classifier=StubClassifier("balanced"))
         r.decide("rt", "x")  # u1

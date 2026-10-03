@@ -22,7 +22,9 @@ from .catalog import (
     build_model_index,
     canon,
     load_aa_indices,
+    load_aa_performance,
     load_models,
+    performance_from_entry,
     quality_from_indices,
     rank_candidates,
     resolve_ref,
@@ -146,6 +148,18 @@ def build_costs(models, cache_dir):
             if s.get("avg_cost_usd") is not None:
                 costs[ref] = s["avg_cost_usd"]
     return costs
+
+
+def build_latency(models, cache_dir):
+    """ref -> median performance metrics (TTFT, output speed) from AA, where available."""
+    perf_map = load_aa_performance(cache_dir)
+    latency = {}
+    if perf_map:
+        for ref, m in models.items():
+            perf = perf_map.get(canon(m.id)) or perf_map.get(canon(m.name))
+            if perf:
+                latency[ref] = perf
+    return latency
 
 
 def _load_anchors(cache_dir):
@@ -293,7 +307,7 @@ def cmd_evaluate(args) -> None:
         [(text, lab) for _tid, text, lab in train],
         label_smoothing=float((cfg.get("classifier") or {}).get("label_smoothing", 0.0)),
     )
-    router = Router(cfg, models, clf, quality=quality, anchors=_load_anchors(args.cache_dir), costs=build_costs(models, args.cache_dir), outcomes=_load_outcomes(args.cache_dir))
+    router = Router(cfg, models, clf, quality=quality, anchors=_load_anchors(args.cache_dir), costs=build_costs(models, args.cache_dir), outcomes=_load_outcomes(args.cache_dir), latency=build_latency(models, args.cache_dir))
 
     tier_match = 0
     routed_with_stats = 0
@@ -443,7 +457,7 @@ def cmd_route(args) -> None:
     clf = load_classifier(args.cache_dir)
     store = RunStore(os.path.join(args.cache_dir, "runs"))
     anchors = _load_anchors(args.cache_dir)
-    router = Router(cfg, models, clf, store, quality=quality, anchors=anchors, costs=build_costs(models, args.cache_dir), outcomes=_load_outcomes(args.cache_dir))
+    router = Router(cfg, models, clf, store, quality=quality, anchors=anchors, costs=build_costs(models, args.cache_dir), outcomes=_load_outcomes(args.cache_dir), latency=build_latency(models, args.cache_dir))
 
     task = args.task or ""
     if not task and not sys.stdin.isatty():
@@ -475,6 +489,7 @@ def cmd_rank(args) -> None:
             if s.get("pass_rate") is not None:
                 quality[ref] = s["pass_rate"]
     aa = load_aa_indices(args.cache_dir)
+    perf_map = load_aa_performance(args.cache_dir)
 
     print("%-38s %9s %9s %8s %s" % ("model", "in$/M", "out$/M", "pass", "AA indices"))
     for ref, _blended, _q in rank_candidates(refs, models, quality):
@@ -483,8 +498,13 @@ def cmd_rank(args) -> None:
             print("%-38s %9s" % (ref, "(not in catalog)"))
             continue
         q = quality.get(ref)
-        idx = aa.get(canon(m.id)) or aa.get(canon(m.name))
+        entry = aa.get(canon(m.id)) or aa.get(canon(m.name))
+        idx = entry
         idx_str = ", ".join("%s=%.1f" % (k, v) for k, v in (idx or {}).items()) if idx else ""
+        perf = perf_map.get(canon(m.id)) or perf_map.get(canon(m.name))
+        ttft = (perf or {}).get("median_time_to_first_token_seconds")
+        if ttft is not None:
+            idx_str = ("%s ttft=%.1fs" % (idx_str, ttft)).strip()
         print(
             "%-38s %9.2f %9.2f %7s %s"
             % (ref, m.cost_in, m.cost_out, ("%.0f%%" % (100 * q)) if q is not None else "-", idx_str)

@@ -121,6 +121,20 @@ def resolve_ref(provider: str, model: str, models: Dict[str, "Model"], index: Op
     return candidates[0]
 
 
+def load_aa_performance(cache_dir: str) -> Dict[str, Dict[str, float]]:
+    """Median performance metrics per canon(slug) from the cached raw AA entries."""
+    raw = read_json(os.path.join(cache_dir, AA_CACHE))
+    out: Dict[str, Dict[str, float]] = {}
+    for entry in raw or []:
+        if not isinstance(entry, dict):
+            continue
+        slug = entry.get("slug") or entry.get("name")
+        perf = performance_from_entry(entry)
+        if slug and perf:
+            out[canon(str(slug))] = perf
+    return out
+
+
 def load_aa_indices(
     cache_dir: str,
     api_key: Optional[str] = None,
@@ -221,6 +235,18 @@ def quality_from_indices(
             if field in key and isinstance(value, (int, float)) and not isinstance(value, bool):
                 return max(0.0, min(1.0, float(value) / 100.0))
     return None
+
+
+def performance_from_entry(entry: Optional[dict]) -> Dict[str, float]:
+    """Median latency/throughput metrics from an AA entry's performance block."""
+    perf = (entry or {}).get("performance")
+    if not isinstance(perf, dict):
+        return {}
+    out: Dict[str, float] = {}
+    for key, value in perf.items():
+        if "median" in key and isinstance(value, (int, float)) and not isinstance(value, bool):
+            out[str(key)] = float(value)
+    return out
 
 
 def _extract_aa_entries(entries) -> Dict[str, Dict[str, float]]:
