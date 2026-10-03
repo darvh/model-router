@@ -20,9 +20,9 @@ from . import __version__
 from ._net import read_json
 from .catalog import (
     build_model_index,
+    canon,
     load_aa_indices,
     load_models,
-    normalize_name,
     quality_from_indices,
     rank_candidates,
     resolve_ref,
@@ -43,6 +43,22 @@ from .engine import ADVISOR_SIGNAL, DEFAULT_SIGNAL_RULES, ESCALATING_SIGNALS, FL
 DEFAULT_CACHE = os.environ.get("MODEL_ROUTER_CACHE") or os.path.join(
     os.path.expanduser("~"), ".cache", "model-router"
 )
+
+
+def _load_dotenv(path: str = ".env") -> None:
+    """Minimal .env loader: KEY=VALUE lines, never overrides existing env, never logs values."""
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _sep, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
 
 
 def load_config(path: str) -> dict:
@@ -82,7 +98,8 @@ def build_quality(models, cache_dir):
     aa = load_aa_indices(cache_dir)
     if aa:
         for ref, m in models.items():
-            q = quality_from_indices(aa.get(normalize_name(m.name)))
+            entry = aa.get(canon(m.id)) or aa.get(canon(m.name))
+            q = quality_from_indices(entry)
             if q is not None:
                 quality[ref] = q
     return quality
@@ -91,7 +108,11 @@ def build_quality(models, cache_dir):
 def cmd_refresh(args) -> None:
     models = load_models(args.cache_dir, force=args.force)
     print("models.dev: %d models cached" % len(models))
-    indices = load_aa_indices(args.cache_dir, api_key=args.aa_key, force=args.force)
+    try:
+        indices = load_aa_indices(args.cache_dir, api_key=args.aa_key, force=args.force, raise_errors=True)
+    except Exception as exc:
+        print("AA fetch failed: %s" % exc)
+        indices = load_aa_indices(args.cache_dir, api_key=args.aa_key)
     if indices:
         print("AA indices: %d models" % len(indices))
     else:
@@ -355,7 +376,6 @@ def cmd_rank(args) -> None:
             if s.get("pass_rate") is not None:
                 quality[ref] = s["pass_rate"]
     aa = load_aa_indices(args.cache_dir)
-    aa_by_norm = {normalize_name(m.name): m for m in models.values() if m.name}
 
     print("%-38s %9s %9s %8s %s" % ("model", "in$/M", "out$/M", "pass", "AA indices"))
     for ref, _blended, _q in rank_candidates(refs, models, quality):
@@ -364,7 +384,7 @@ def cmd_rank(args) -> None:
             print("%-38s %9s" % (ref, "(not in catalog)"))
             continue
         q = quality.get(ref)
-        idx = aa_by_norm.get(normalize_name(m.name)) and aa.get(normalize_name(m.name))
+        idx = aa.get(canon(m.id)) or aa.get(canon(m.name))
         idx_str = ", ".join("%s=%.1f" % (k, v) for k, v in (idx or {}).items()) if idx else ""
         print(
             "%-38s %9.2f %9.2f %7s %s"
@@ -383,6 +403,7 @@ def cmd_tiers(args) -> None:
 
 
 def main(argv=None) -> None:
+    _load_dotenv()
     parser = argparse.ArgumentParser(prog="model-router", description=__doc__)
     parser.add_argument("--version", action="version", version=__version__)
     sub = parser.add_subparsers(dest="cmd", required=True)

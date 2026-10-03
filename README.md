@@ -70,11 +70,13 @@ python3 -m model_router route --run-id r1 --task "fix the pagination off-by-one"
 Artificial Analysis key (optional, free tier - 100 req/day):
 
 ```bash
-export AA_API_KEY=your-key           # or per call: model_router refresh --aa-key your-key
-python3 -m model_router refresh      # fetches once, caches indices for 7 days
+export AA_API_KEY=your-key           # or put AA_API_KEY=... in a repo-root .env (gitignored)
+python3 -m model_router refresh      # free language-models endpoint, ~4 requests, cached 7 days
 ```
 
-Keep the key in the environment, not in `config.json` - this repo is public.
+The key feeds quality `Q` (coding index > agentic > intelligence) for ~680 matched models;
+models without AA data fall back to DeepSWE pass rate. Keep the key out of `config.json`
+and never commit `.env` - this repo is public.
 
 Route a run:
 

@@ -16,7 +16,7 @@ from typing import Dict, List, Optional, Tuple
 from ._net import fetch_json_cached, read_json, write_json
 
 MODELS_DEV_URL = "https://models.dev/api.json"
-AA_URL = "https://artificialanalysis.ai/api/v2/language/models"
+AA_URL = "https://artificialanalysis.ai/api/v2/language/models/free"  # free tier endpoint
 AA_CACHE = "aa-language-models.json"
 AA_INDICES_CACHE = "aa-indices.json"
 
@@ -119,37 +119,17 @@ def resolve_ref(provider: str, model: str, models: Dict[str, "Model"], index: Op
     return candidates[0]
 
 
-_INDEX_FIELD_RE = re.compile(r"(intelligence|coding|agentic|math)", re.I)
-
-
-def _collect_indices(obj, out: Dict[str, Dict[str, float]], name_hint: Optional[str] = None) -> None:
-    """Tolerantly walk an unknown JSON shape collecting numeric index fields per model name."""
-    if isinstance(obj, dict):
-        name = obj.get("name") or obj.get("model_name") or name_hint
-        nums = {}
-        for k, v in obj.items():
-            if isinstance(v, (int, float)) and not isinstance(v, bool) and _INDEX_FIELD_RE.search(k):
-                nums[k.lower()] = float(v)
-        if nums and name:
-            out.setdefault(normalize_name(str(name)), {}).update(nums)
-        for v in obj.values():
-            _collect_indices(v, out, name_hint=str(name) if name else name_hint)
-    elif isinstance(obj, list):
-        for v in obj:
-            _collect_indices(v, out, name_hint=name_hint)
-
-
 def load_aa_indices(
     cache_dir: str,
     api_key: Optional[str] = None,
     force: bool = False,
     max_age_hours: float = 168.0,
+    raise_errors: bool = False,
 ) -> Dict[str, Dict[str, float]]:
-    """Artificial Analysis index scores keyed by normalized model name.
+    """Artificial Analysis index scores keyed by canon(slug).
 
-    Requires AA_API_KEY (free tier). Cached for a week by default - AA updates
-    roughly weekly and the free tier is 100 req/day. Without a key, returns the
-    cached copy (possibly empty); cost-only ranking still works.
+    Uses the free endpoint (paginated, ~4 requests), cached for a week by default.
+    Without a key, returns the cached copy (possibly empty); DeepSWE quality still works.
     """
     indices_path = os.path.join(cache_dir, AA_INDICES_CACHE)
     cached = read_json(indices_path)
@@ -161,14 +141,21 @@ def load_aa_indices(
     if not key:
         return cached or {}
     try:
-        from ._net import fetch_json
-
-        raw = fetch_json_with_key(AA_URL, key)
+        entries: List[dict] = []
+        page = 1
+        while page <= 10:
+            data = fetch_json_with_key("%s?page=%d" % (AA_URL, page), key)
+            entries.extend(data.get("data") or [])
+            pagination = data.get("pagination") or {}
+            if not pagination.get("has_more"):
+                break
+            page += 1
     except Exception:
+        if raise_errors and not cached:
+            raise
         return cached or {}
-    write_json(os.path.join(cache_dir, AA_CACHE), raw)
-    out: Dict[str, Dict[str, float]] = {}
-    _collect_indices(raw, out)
+    write_json(os.path.join(cache_dir, AA_CACHE), entries)
+    out = _extract_aa_entries(entries)
     write_json(indices_path, out)
     return out
 
@@ -210,12 +197,37 @@ def quality_from_indices(indices: Optional[Dict[str, float]]) -> Optional[float]
         return None
     for field in AA_QUALITY_FIELDS:
         for key, value in indices.items():
+            if "cost" in key or "price" in key:
+                continue
             if field in key and isinstance(value, (int, float)) and not isinstance(value, bool):
                 q = float(value)
                 if q > 1.5:  # indices are 0..100; scale to 0..1
                     q /= 100.0
                 return max(0.0, min(1.0, q))
     return None
+
+
+def _extract_aa_entries(entries) -> Dict[str, Dict[str, float]]:
+    """AA free-endpoint entries -> {canon(slug): {index_name: value}}."""
+    out: Dict[str, Dict[str, float]] = {}
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        slug = entry.get("slug") or entry.get("name")
+        evaluations = entry.get("evaluations")
+        if not slug or not isinstance(evaluations, dict):
+            continue
+        nums = {
+            str(k).lower(): float(v)
+            for k, v in evaluations.items()
+            if isinstance(v, (int, float))
+            and not isinstance(v, bool)
+            and "cost" not in str(k).lower()
+            and "price" not in str(k).lower()
+        }
+        if nums:
+            out[canon(str(slug))] = nums
+    return out
 
 
 def rank_candidates(

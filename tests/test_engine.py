@@ -292,6 +292,7 @@ class RankingTests(unittest.TestCase):
         self.assertEqual(quality_from_indices({"coding": 120.0}), 1.0)
         self.assertIsNone(quality_from_indices(None))
         self.assertIsNone(quality_from_indices({"math": 70.0}))
+        self.assertIsNone(quality_from_indices({"artificial_analysis_intelligence_index_cost": 12.0}))
 
 
 class AaCacheTests(unittest.TestCase):
