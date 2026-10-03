@@ -57,7 +57,11 @@ Short version:
 5. Every decision returns model + effort + advisor + accumulating instruction stack;
    the caller executes.
 6. Failures escalate one tier and flag advisor review; `complete` ends the run.
-7. `evaluate` replays held-out tasks as policies and reports $ per verified success.
+7. Report the run's outcome (`outcome --success/--failure --cost`) and the engine blends
+   it into future quality/cost priors per (model, domain) - empirical Bayes with
+   `outcomes.prior_weight` pseudo-counts. Static priors decay in importance as real
+   outcomes accumulate.
+8. `evaluate` replays held-out tasks as policies and reports $ per verified success.
 
 ## Quickstart
 
@@ -92,6 +96,7 @@ python3 -m model_router route --run-id r1 --message "still not working!!"  # fru
 python3 -m model_router route --run-id r1 --signal tool_error_rate=0.5     # tool errors -> escalate
 python3 -m model_router route --run-id r1 --signal needs_advisor    # advisor_required=true
 python3 -m model_router route --run-id r1 --signal complete         # sticky run ends
+python3 -m model_router outcome --run-id r1 --success --cost 0.12   # feed the outcome back; priors adapt
 ```
 
 Decision shape (trimmed):
@@ -209,6 +214,10 @@ Findings, honestly:
   (effort + model-specific params), advisor fork, escalation timing, instruction stack.
   It does not control prompts beyond the stack, tool policy, or execution - that is the
   caller's side.
+- **Adaptive priors**: `outcome` records observed success/cost per (model, domain) and
+  blends them into Q and C with empirical-Bayes weighting (`outcomes.prior_weight`,
+  default 5). One coding win moved deepseek-v4-flash's Q 0.53 -> 0.61; one math loss
+  dropped its math Q to 0.44. This is the loop that beats any static prior over time.
 - `min_rate` 0.5 labels a task "tier sufficient" only when a model passed at least half
   its non-errored attempts; thin trial counts make labels noisy.
 
@@ -225,6 +234,7 @@ Findings, honestly:
                                     "tool_error_rate": { "threshold": 0.3, "action": "escalate" } } },
   "efforts":    { "utility": "low", "balanced": "medium", "frontier": "medium" },  // per tier or "<provider/model>"
   "effort_budgets": { "low": 1024, "medium": 8192, "high": 32768 },  // optional; for budget_tokens models
+  "outcomes":   { "prior_weight": 5.0 },  // optional; pseudo-counts for offline priors vs observed outcomes
   "classifier": { "frontier_prob": 0.45, "utility_prob": 0.55 },
   "instructions": { "base": "...", "escalation": "...", "advisor": "..." }
 }

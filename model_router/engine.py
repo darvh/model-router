@@ -159,6 +159,7 @@ class Router:
         anchors: Optional[Dict[str, float]] = None,
         efforts: Optional[Dict[str, str]] = None,
         costs: Optional[Dict[str, float]] = None,
+        outcomes: Optional[Dict[str, dict]] = None,
     ):
         self.config = config
         self.models = models or {}
@@ -167,6 +168,10 @@ class Router:
         self.quality = dict(quality or {})  # ref -> 0..1 capability (AA index, DeepSWE pass)
         self.anchors = dict(anchors or {})  # calibrated tier -> required quality
         self.costs = dict(costs or {})  # measured $/task where available; else catalog price
+        # Observed outcomes, keyed "ref|domain": {"n", "successes", "cost_sum", "cost_n"}.
+        # Mutated in place by record_outcome so callers can persist the same dict.
+        self.outcomes = outcomes if outcomes is not None else {}
+        self.prior_weight = float((config.get("outcomes") or {}).get("prior_weight", 5.0))
         self.efforts = dict(DEFAULT_EFFORTS)
         self.efforts.update(efforts or {})
         self.efforts.update(config.get("efforts") or {})  # config wins over defaults/injected
@@ -289,6 +294,13 @@ class Router:
             if c is None:
                 m = self.models.get(ref)
                 c = m.blended_cost if m else None
+            observed, count = self._observed_cost(ref)
+            if observed is not None:
+                if c is None:
+                    c = observed
+                else:
+                    w = self.prior_weight
+                    c = (c * w + observed * count) / (w + count)
             values.append(c)
         known = [v for v in values if v is not None]
         lo, hi = (min(known), max(known)) if known else (0.0, 1.0)
@@ -337,14 +349,34 @@ class Router:
     def _quality_of(self, ref: str, domain: str = "general") -> Optional[float]:
         """Capability 0..1 for a candidate in the task's domain.
 
-        quality may be a flat float (DeepSWE pass / injected) or a raw AA index dict.
+        Blends the offline prior (AA/DeepSWE or injected float) with observed run
+        outcomes (empirical Bayes, prior_weight pseudo-counts).
         """
         entry = self.quality.get(ref)
-        if entry is None:
-            return None
-        if isinstance(entry, (int, float)) and not isinstance(entry, bool):
-            return float(entry)
-        return quality_from_indices(entry, priority=DOMAIN_QUALITY_PRIORITY.get(domain))
+        prior = None
+        if entry is not None:
+            if isinstance(entry, (int, float)) and not isinstance(entry, bool):
+                prior = float(entry)
+            else:
+                prior = quality_from_indices(entry, priority=DOMAIN_QUALITY_PRIORITY.get(domain))
+        obs = self.outcomes.get("%s|%s" % (ref, domain))
+        if obs and obs.get("n", 0) > 0:
+            n = float(obs["n"])
+            successes = float(obs.get("successes", 0))
+            if prior is None:
+                return successes / n
+            w = self.prior_weight
+            return (successes + w * prior) / (n + w)
+        return prior
+
+    def _observed_cost(self, ref: str) -> Tuple[Optional[float], float]:
+        """Average observed $/task for a ref across domains, and its sample count."""
+        total = count = 0.0
+        for key, obs in self.outcomes.items():
+            if key.split("|", 1)[0] == ref and obs.get("cost_n"):
+                total += float(obs.get("cost_sum", 0.0))
+                count += float(obs["cost_n"])
+        return ((total / count) if count else None), count
 
     def _score(self, ref: str, mode: str, domain: str = "general") -> float:
         """Objective score (higher better). Q in 0..1; cost normalized 0=cheap..1=pricey."""
@@ -530,6 +562,26 @@ class Router:
         if state is not None:
             state.closed = True
             self.store.put(state)
+
+    def record_outcome(self, run_id: str, success: bool, cost_usd: Optional[float] = None) -> Optional[dict]:
+        """Feed a finished run's outcome back in; adapts future priors for (ref, domain).
+
+        The outcomes dict is mutated in place - callers persist it (CLI writes
+        outcomes.json). Close the run separately when the sticky run ends.
+        """
+        state = self.store.get(run_id)
+        if state is None:
+            return None
+        ref = self.ladder[state.ladder_index][1]
+        key = "%s|%s" % (ref, state.domain)
+        obs = self.outcomes.setdefault(key, {"n": 0, "successes": 0, "cost_sum": 0.0, "cost_n": 0})
+        obs["n"] = int(obs.get("n", 0)) + 1
+        if success:
+            obs["successes"] = int(obs.get("successes", 0)) + 1
+        if cost_usd is not None:
+            obs["cost_sum"] = float(obs.get("cost_sum", 0.0)) + float(cost_usd)
+            obs["cost_n"] = int(obs.get("cost_n", 0)) + 1
+        return {"ref": ref, "domain": state.domain, "n": obs["n"], "successes": obs["successes"]}
 
     def state(self, run_id: str) -> Optional[RunState]:
         return self.store.get(run_id)

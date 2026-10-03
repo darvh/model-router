@@ -274,6 +274,24 @@ class EngineTests(unittest.TestCase):
         r.quality["p/u2"] = 0.55  # flat float still works
         self.assertAlmostEqual(r._quality_of("p/u2", "coding"), 0.55)
 
+    def test_outcome_blending_and_recording(self):
+        outcomes = {}
+        r = Router(
+            CONFIG, make_models(), classifier=StubClassifier("balanced"),
+            quality={"p/u1": 0.5}, outcomes=outcomes,
+        )
+        self.assertAlmostEqual(r._quality_of("p/u1", "general"), 0.5)
+        outcomes["p/u1|general"] = {"n": 9, "successes": 9, "cost_sum": 0.0, "cost_n": 0}
+        self.assertGreater(r._quality_of("p/u1", "general"), 0.7)  # observations beat the prior
+
+        r.decide("ro1", "x")
+        info = r.record_outcome("ro1", success=True, cost_usd=0.12)
+        self.assertEqual(info["ref"], "p/u1")
+        self.assertEqual(outcomes["p/u1|general"]["n"], 10)  # 9 pre-seeded + 1 recorded
+        self.assertEqual(outcomes["p/u1|general"]["successes"], 10)
+        self.assertEqual(outcomes["p/u1|general"]["cost_n"], 1)
+        self.assertIsNone(r.record_outcome("missing", success=True))
+
     def test_escalation_caps_at_top(self):
         r = Router(CONFIG, make_models(), classifier=StubClassifier("balanced"))
         r.decide("rt", "x")  # u1

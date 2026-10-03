@@ -152,6 +152,30 @@ def _load_anchors(cache_dir):
     return read_json(os.path.join(cache_dir, "anchors.json")) or {}
 
 
+def _load_outcomes(cache_dir):
+    return read_json(os.path.join(cache_dir, "outcomes.json")) or {}
+
+
+def cmd_outcome(args) -> None:
+    cfg = load_config(args.config)
+    models = load_models(args.cache_dir)
+    store = RunStore(os.path.join(args.cache_dir, "runs"))
+    router = Router(
+        cfg,
+        models,
+        store=store,
+        quality=build_quality(models, args.cache_dir),
+        anchors=_load_anchors(args.cache_dir),
+        costs=build_costs(models, args.cache_dir),
+        outcomes=_load_outcomes(args.cache_dir),
+    )
+    info = router.record_outcome(args.run_id, bool(args.success), cost_usd=args.cost)
+    if info is None:
+        sys.exit("unknown run: %s" % args.run_id)
+    write_json(os.path.join(args.cache_dir, "outcomes.json"), router.outcomes)
+    print("recorded:", json.dumps(info))
+
+
 def _calibrate_anchors(labels_map, task_stats, quality):
     """Median observed required quality per tier: min Q among models that reliably passed."""
     per_tier = {t: [] for t in TIERS}
@@ -269,7 +293,7 @@ def cmd_evaluate(args) -> None:
         [(text, lab) for _tid, text, lab in train],
         label_smoothing=float((cfg.get("classifier") or {}).get("label_smoothing", 0.0)),
     )
-    router = Router(cfg, models, clf, quality=quality, anchors=_load_anchors(args.cache_dir), costs=build_costs(models, args.cache_dir))
+    router = Router(cfg, models, clf, quality=quality, anchors=_load_anchors(args.cache_dir), costs=build_costs(models, args.cache_dir), outcomes=_load_outcomes(args.cache_dir))
 
     tier_match = 0
     routed_with_stats = 0
@@ -419,7 +443,7 @@ def cmd_route(args) -> None:
     clf = load_classifier(args.cache_dir)
     store = RunStore(os.path.join(args.cache_dir, "runs"))
     anchors = _load_anchors(args.cache_dir)
-    router = Router(cfg, models, clf, store, quality=quality, anchors=anchors, costs=build_costs(models, args.cache_dir))
+    router = Router(cfg, models, clf, store, quality=quality, anchors=anchors, costs=build_costs(models, args.cache_dir), outcomes=_load_outcomes(args.cache_dir))
 
     task = args.task or ""
     if not task and not sys.stdin.isatty():
@@ -513,6 +537,15 @@ def main(argv=None) -> None:
     p.add_argument("--message", action="append", default=[], help="recent user message (repeatable); auto-scores user_frustration")
     p.add_argument("--instruction", action="append", default=[], help="append to the run instruction stack")
     p.set_defaults(func=cmd_route)
+
+    p = sub.add_parser("outcome", help="record a run outcome for adaptive priors")
+    base(p)
+    p.add_argument("--run-id", required=True)
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("--success", action="store_true")
+    group.add_argument("--failure", action="store_true")
+    p.add_argument("--cost", type=float, default=None, help="observed cost in USD")
+    p.set_defaults(func=cmd_outcome)
 
     p = sub.add_parser("rank", help="rank candidate models by cost + real quality signal")
     base(p)
