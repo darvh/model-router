@@ -211,6 +211,28 @@ class EngineTests(unittest.TestCase):
         r = Router(base, make_models(), classifier=StubClassifier("balanced"), quality=quality)
         self.assertEqual(r.decide("rq1", "x").model, "p/b1")
 
+    def test_effort_defaults_and_overrides(self):
+        r = Router(CONFIG, make_models(), classifier=StubClassifier("balanced"))
+        self.assertEqual(r.decide("re1", "x").effort, "low")  # utility default
+        cfg = _json.loads(_json.dumps(CONFIG))
+        cfg["efforts"] = {"p/u1": "high"}
+        r2 = Router(cfg, make_models(), classifier=StubClassifier("balanced"))
+        self.assertEqual(r2.decide("re2", "x").effort, "high")  # ref override wins
+        cfg["efforts"] = {"utility": "medium"}
+        r3 = Router(cfg, make_models(), classifier=StubClassifier("balanced"))
+        self.assertEqual(r3.decide("re3", "x").effort, "medium")
+
+    def test_anchors_resolution(self):
+        base = _json.loads(_json.dumps(CONFIG))
+        base["decision"] = {"mode": "cost"}
+        probs = {"utility": 0.0, "balanced": 1.0, "frontier": 0.0}
+        anchors = {"utility": 0.2, "balanced": 0.4, "frontier": 0.6}
+        r = Router(base, make_models(), classifier=StubClassifier("balanced", probs), anchors=anchors)
+        self.assertAlmostEqual(r.decide("ra1", "x").rationale["required_quality"], 0.4)
+        base["decision"]["tier_requirement"] = {"utility": 0.3, "balanced": 0.9, "frontier": 0.95}
+        r2 = Router(base, make_models(), classifier=StubClassifier("balanced", probs), anchors=anchors)
+        self.assertAlmostEqual(r2.decide("ra2", "x").rationale["required_quality"], 0.9)
+
     def test_escalation_caps_at_top(self):
         r = Router(CONFIG, make_models(), classifier=StubClassifier("balanced"))
         r.decide("rt", "x")  # u1
@@ -266,11 +288,21 @@ class ClassifierTests(unittest.TestCase):
             examples = [("small quick fix %d" % i, "utility") for i in range(5)]
             examples += [("huge complex redesign %d" % i, "frontier") for i in range(5)]
             clf = Classifier().fit(examples)
+            clf.temperature = 2.0
             path = os.path.join(td, "classifier.json")
             clf.save(path)
             clf2 = Classifier.load(path)
+            self.assertEqual(clf2.temperature, 2.0)
             self.assertEqual(clf.predict("small quick fix")[0], clf2.predict("small quick fix")[0])
             self.assertEqual(clf.predict("huge complex redesign")[0], clf2.predict("huge complex redesign")[0])
+
+    def test_temperature_softens(self):
+        from model_router.classify import apply_temperature
+
+        probs = {"utility": 0.98, "balanced": 0.02}
+        softened = apply_temperature(probs, 4.0)
+        self.assertLess(softened["utility"], 0.98)
+        self.assertAlmostEqual(sum(softened.values()), 1.0)
 
 
 class LabelsTests(unittest.TestCase):
@@ -406,6 +438,21 @@ class CliHelpersTests(unittest.TestCase):
             _parse_signals(["nope"], [], {})
         with self.assertRaises(SystemExit):
             _parse_signals(["tool_error_rate=abc"], [], {})
+
+    def test_calibrate_anchors(self):
+        from model_router.cli import _calibrate_anchors
+
+        labels_map = {"t1": "utility", "t2": "balanced"}
+        stats = {
+            ("t1", "p/u1"): {"pass_rate": 1.0},
+            ("t1", "p/b1"): {"pass_rate": 1.0},
+            ("t2", "p/u1"): {"pass_rate": 0.0},
+            ("t2", "p/b1"): {"pass_rate": 0.8},
+        }
+        quality = {"p/u1": 0.5, "p/b1": 0.9}
+        anchors = _calibrate_anchors(labels_map, stats, quality)
+        self.assertEqual(anchors["utility"], 0.5)
+        self.assertEqual(anchors["balanced"], 0.9)
 
 
 if __name__ == "__main__":

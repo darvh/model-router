@@ -36,6 +36,9 @@ ADVISOR_SIGNAL = "needs_advisor"
 # classifier's tier probabilities into a required-quality number for the task.
 DEFAULT_TIER_REQUIREMENT = {"utility": 0.35, "balanced": 0.6, "frontier": 0.8}
 
+# Default reasoning effort per tier: cost-conscious (low/medium), never benchmark-max.
+DEFAULT_EFFORTS = {"utility": "low", "balanced": "medium", "frontier": "medium"}
+
 # Optional numeric signal rules. Fires only when the caller passes the signal;
 # config decision.signal_rules replaces this map entirely.
 DEFAULT_SIGNAL_RULES = {
@@ -50,6 +53,7 @@ class Decision:
     turn: int
     tier: str
     model: str
+    effort: str
     advisor: str
     advisor_instruction: str
     advisor_required: bool
@@ -131,12 +135,18 @@ class Router:
         classifier=None,
         store: Optional[RunStore] = None,
         quality: Optional[Dict[str, float]] = None,
+        anchors: Optional[Dict[str, float]] = None,
+        efforts: Optional[Dict[str, str]] = None,
     ):
         self.config = config
         self.models = models or {}
         self.classifier = classifier
         self.store = store or RunStore()
         self.quality = dict(quality or {})  # ref -> 0..1 capability (AA index, DeepSWE pass)
+        self.anchors = dict(anchors or {})  # calibrated tier -> required quality
+        self.efforts = dict(DEFAULT_EFFORTS)
+        self.efforts.update(efforts or {})
+        self.efforts.update(config.get("efforts") or {})  # config wins over defaults/injected
         self.ladder: List[Tuple[str, str]] = []
         for tier, spec in config["tiers"].items():
             for ref in spec["models"]:
@@ -221,6 +231,7 @@ class Router:
             turn=state.turn,
             tier=tier,
             model=model,
+            effort=self._resolve_effort(tier, model),
             advisor=self._resolve_advisor(tier, model),
             advisor_instruction=instructions.get("advisor", ""),
             advisor_required=state.advisor_required,
@@ -260,9 +271,16 @@ class Router:
         return out
 
     def _required_quality(self, probs: Dict[str, float]) -> float:
-        """Task -> required capability number: sum(tier prob * tier anchor)."""
-        anchors = (self.config.get("decision") or {}).get("tier_requirement") or DEFAULT_TIER_REQUIREMENT
+        """Task -> required capability number: sum(tier prob * tier anchor).
+
+        Anchor priority: config decision.tier_requirement > calibrated anchors > defaults.
+        """
+        explicit = (self.config.get("decision") or {}).get("tier_requirement")
+        anchors = explicit if explicit else (self.anchors or DEFAULT_TIER_REQUIREMENT)
         return sum(float(probs.get(t, 0.0)) * float(anchors.get(t, 0.0)) for t in TIERS)
+
+    def _resolve_effort(self, tier: str, model: str) -> str:
+        return self.efforts.get(model) or self.efforts.get(tier) or "medium"
 
     def _score(self, ref: str, mode: str) -> float:
         """Objective score (higher better). Q in 0..1; cost normalized 0=cheap..1=pricey."""
@@ -358,6 +376,7 @@ class Router:
                     turn=0,
                     tier="",
                     model="",
+                    effort="",
                     advisor="",
                     advisor_instruction="",
                     advisor_required=False,

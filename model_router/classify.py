@@ -112,6 +112,15 @@ def frustration_score(messages: Sequence[str]) -> float:
     return min(1.0, score / 2.0)
 
 
+def apply_temperature(probs: Dict[str, float], temperature: float) -> Dict[str, float]:
+    """Soften (T>1) or sharpen (T<1) a probability dict. Used for calibration."""
+    if temperature <= 0 or abs(temperature - 1.0) < 1e-9:
+        return dict(probs)
+    powered = {k: max(float(v), 1e-12) ** (1.0 / temperature) for k, v in probs.items()}
+    z = sum(powered.values())
+    return {k: v / z for k, v in powered.items()}
+
+
 class Vectorizer:
     def __init__(self, max_features: int = 1200, min_df: int = 2, max_df: float = 0.8):
         self.max_features = max_features
@@ -216,6 +225,7 @@ class Classifier:
             src["utility"] = src.pop("utility_prob")
         t.update(src)
         self.thresholds = t
+        self.temperature = 1.0
         self.vec: Optional[Vectorizer] = None
         self.model: Optional[SoftmaxRegression] = None
         self.meta: dict = {}
@@ -246,14 +256,15 @@ class Classifier:
         self.meta["trained_on"] = n
         return self
 
-    def predict(self, text: str) -> Tuple[str, Dict[str, float], str]:
+    def _probs(self, text: str) -> Tuple[Dict[str, float], str]:
         if self.model is None or self.vec is None:
-            probs = heuristic_probs(text)
-            source = "heuristic"
-        else:
-            p = self.model.probs(self.vec.transform(text))
-            probs = {c: p[i] for i, c in enumerate(self.meta["classes"])}
-            source = "trained"
+            return heuristic_probs(text), "heuristic"
+        p = self.model.probs(self.vec.transform(text))
+        probs = {c: p[i] for i, c in enumerate(self.meta["classes"])}
+        return apply_temperature(probs, self.temperature), "trained"
+
+    def predict(self, text: str) -> Tuple[str, Dict[str, float], str]:
+        probs, source = self._probs(text)
         if probs.get("frontier", 0.0) >= self.thresholds["frontier"]:
             return "frontier", probs, source
         if probs.get("utility", 0.0) >= self.thresholds["utility"]:
@@ -273,6 +284,7 @@ class Classifier:
     def to_dict(self) -> dict:
         return {
             "thresholds": self.thresholds,
+            "temperature": self.temperature,
             "vectorizer": self.vec.to_dict() if self.vec else None,
             "weights": [dict(w) for w in self.model.w] if self.model else None,
             "bias": self.model.b if self.model else None,
@@ -282,6 +294,7 @@ class Classifier:
     @classmethod
     def from_dict(cls, d: dict) -> "Classifier":
         c = cls(d.get("thresholds"))
+        c.temperature = float(d.get("temperature", 1.0))
         if d.get("vectorizer"):
             c.vec = Vectorizer.from_dict(d["vectorizer"])
         if d.get("weights") is not None:
@@ -322,3 +335,44 @@ def kfold_accuracy(
             total += 1
             confusion[(y, pred)] += 1
     return (correct / total if total else 0.0), confusion
+
+
+def calibrate_temperature(
+    examples: Sequence[Tuple[str, str]],
+    k: int = 5,
+    seed: int = 0,
+    epochs: int = 100,
+    lr: float = 0.3,
+    l2: float = 1e-3,
+) -> Tuple[float, float]:
+    """Fit a probability temperature on out-of-fold predictions (min NLL).
+
+    Returns (temperature, nll). T > 1 means the raw probabilities were overconfident.
+    """
+    rng = random.Random(seed)
+    idx = list(range(len(examples)))
+    rng.shuffle(idx)
+    folds = [idx[i::k] for i in range(k)]
+    oof: List[Tuple[Dict[str, float], str]] = []
+    for f in range(k):
+        test_idx = set(folds[f])
+        train = [examples[i] for i in idx if i not in test_idx]
+        if not train:
+            continue
+        clf = Classifier().fit(train, epochs=epochs, lr=lr, l2=l2)
+        for i in folds[f]:
+            text, y = examples[i]
+            probs, _src = clf._probs(text)
+            oof.append((probs, y))
+    if not oof:
+        return 1.0, 0.0
+    best_t, best_nll = 1.0, None
+    for t in (0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0):
+        nll = 0.0
+        for probs, y in oof:
+            calibrated = apply_temperature(probs, t)
+            nll -= math.log(max(calibrated.get(y, 1e-12), 1e-12))
+        nll /= len(oof)
+        if best_nll is None or nll < best_nll:
+            best_t, best_nll = t, nll
+    return best_t, (best_nll or 0.0)

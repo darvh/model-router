@@ -38,11 +38,6 @@
   },
   "decision": {
     "mode": "cost",
-    "tier_requirement": {
-      "utility": 0.35,
-      "balanced": 0.6,
-      "frontier": 0.8
-    },
     "signal_rules": {
       "user_frustration": {
         "threshold": 0.5,
@@ -53,6 +48,11 @@
         "action": "escalate"
       }
     }
+  },
+  "efforts": {
+    "utility": "low",
+    "balanced": "medium",
+    "frontier": "medium"
   },
   "classifier": {
     "frontier_prob": 0.45,

@@ -17,7 +17,7 @@ import sys
 from collections import Counter
 
 from . import __version__
-from ._net import read_json
+from ._net import read_json, write_json
 from .catalog import (
     build_model_index,
     canon,
@@ -28,7 +28,7 @@ from .catalog import (
     resolve_ref,
     tier_of_ref,
 )
-from .classify import Classifier, frustration_score, kfold_accuracy
+from .classify import Classifier, calibrate_temperature, frustration_score, kfold_accuracy
 from .deepswe import (
     DEFAULT_VERSION,
     fetch_instructions,
@@ -138,6 +138,34 @@ def build_quality(models, cache_dir):
     return quality
 
 
+def _load_anchors(cache_dir):
+    return read_json(os.path.join(cache_dir, "anchors.json")) or {}
+
+
+def _calibrate_anchors(labels_map, task_stats, quality):
+    """Median observed required quality per tier: min Q among models that reliably passed."""
+    per_tier = {t: [] for t in TIERS}
+    for tid, label in labels_map.items():
+        qs = [
+            quality[ref]
+            for (task, ref), s in task_stats.items()
+            if task == tid and (s.get("pass_rate") or 0.0) >= 0.5 and ref in quality and quality[ref] is not None
+        ]
+        if qs:
+            per_tier.setdefault(label, []).append(min(qs))
+    anchors = {}
+    for tier in TIERS:
+        vals = sorted(per_tier.get(tier, []))
+        if vals:
+            anchors[tier] = round(vals[len(vals) // 2], 3)
+    prev = 0.0
+    for tier in TIERS:  # enforce monotonicity
+        if tier in anchors:
+            anchors[tier] = max(anchors[tier], prev)
+            prev = anchors[tier]
+    return anchors
+
+
 def cmd_refresh(args) -> None:
     models = load_models(args.cache_dir, force=args.force)
     print("models.dev: %d models cached" % len(models))
@@ -175,6 +203,15 @@ def cmd_calibrate(args) -> None:
     labs = labels(tasks, trials, tier_of, ref_of=make_ref_of(models))
     print("label distribution:", dict(Counter(labs.values())))
 
+    stats = task_model_stats(trials, ref_of=make_ref_of(models))
+    quality = build_quality(models, args.cache_dir)
+    anchors = _calibrate_anchors(labs, stats, quality)
+    if anchors:
+        write_json(os.path.join(args.cache_dir, "anchors.json"), anchors)
+        print("calibrated anchors:", anchors)
+    else:
+        print("calibrated anchors: none (falling back to defaults)")
+
     examples = [(instructions[tid], lab) for tid, lab in labs.items() if instructions.get(tid)]
     if not examples:
         sys.exit("no instructions fetched; nothing to train on")
@@ -185,6 +222,10 @@ def cmd_calibrate(args) -> None:
     print("5-fold CV accuracy: %.1f%%" % (acc * 100))
     for (y, p), c in sorted(confusion.items()):
         print("  %-8s -> %-8s %3d" % (y, p, c))
+
+    temp, nll = calibrate_temperature(examples)
+    clf.temperature = temp
+    print("probability temperature: %.2f (out-of-fold NLL %.3f)" % (temp, nll))
 
     clf.meta["cv_accuracy"] = acc
     clf.meta["trained_on"] = len(examples)
@@ -218,7 +259,7 @@ def cmd_evaluate(args) -> None:
         [(text, lab) for _tid, text, lab in train],
         label_smoothing=float((cfg.get("classifier") or {}).get("label_smoothing", 0.0)),
     )
-    router = Router(cfg, models, clf, quality=quality)
+    router = Router(cfg, models, clf, quality=quality, anchors=_load_anchors(args.cache_dir))
 
     tier_match = 0
     routed_with_stats = 0
@@ -364,7 +405,8 @@ def cmd_route(args) -> None:
     quality = build_quality(models, args.cache_dir)
     clf = load_classifier(args.cache_dir)
     store = RunStore(os.path.join(args.cache_dir, "runs"))
-    router = Router(cfg, models, clf, store, quality=quality)
+    anchors = _load_anchors(args.cache_dir)
+    router = Router(cfg, models, clf, store, quality=quality, anchors=anchors)
 
     task = args.task or ""
     if not task and not sys.stdin.isatty():

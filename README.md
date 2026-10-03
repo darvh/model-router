@@ -40,18 +40,20 @@ flowchart LR
 Short version:
 
 1. `calibrate` labels each DeepSWE task with the cheapest tier that reliably solved
-   it; those labels train the classifier.
+   it; those labels train the classifier, fit a probability temperature (raw probs are
+   wildly overconfident), and derive tier anchors from data (median required Q per tier).
 2. Every candidate model gets a **quality number Q** (0..1): Artificial Analysis
    index when a key is set (coding > agentic > intelligence), else DeepSWE pass rate.
    Cost C is the catalog price, normalized across candidates.
-3. The task gets a **required number r**: `sum(tier prob * tier anchor)` from the
-   classifier's tier probabilities (`decision.tier_requirement`). Feasible models are
-   `Q >= r`.
+3. The task gets a **required number r**: `sum(tier prob * tier anchor)`. Anchor
+   priority: config `decision.tier_requirement` > calibrated anchors > defaults.
+   Feasible models are `Q >= r`.
 4. `decision.mode` picks the start model - `cost`: cheapest feasible; `quality`: max Q;
    `balanced`: max arithmetic mean of Q and cost score `(Q + (1-C)) / 2` - and the run
-   locks (sticky).
-5. Every decision returns model + advisor + accumulating instruction stack; the caller
-   executes.
+   locks (sticky). Decisions also carry a reasoning `effort`: tier default (`utility`
+   low, `balanced`/`frontier` medium), overridable per tier or per model in config.
+5. Every decision returns model + effort + advisor + accumulating instruction stack;
+   the caller executes.
 6. Failures escalate one tier and flag advisor review; `complete` ends the run.
 7. `evaluate` replays held-out tasks as policies and reports $ per verified success.
 
@@ -98,6 +100,7 @@ Decision shape (trimmed):
   "turn": 2,
   "tier": "balanced",
   "model": "google/gemini-3.8-flash",
+  "effort": "medium",
   "advisor": "openai/gpt-5.6-sol",
   "advisor_required": true,
   "advisor_reason": "escalation",
@@ -184,12 +187,15 @@ Findings, honestly:
   utility today), `quality` picks max AA/DeepSWE quality, `balanced` maximizes the
   arithmetic mean of quality and cost score. The router ties the best ladder policy
   ($2.88 per verified success).
-- The text classifier alone is weak on DeepSWE (65.5% CV vs 85% majority baseline,
-  labels: 96 utility / 17 balanced / 0 frontier). It sets the required number `r`; the
-  quality gate plus escalation do the heavy lifting. Tune `tier_requirement` anchors to
-  make the gate stricter or looser.
-- Costs and effort settings are DeepSWE-specific. DeepSWE runs use max/high reasoning
-  effort; the engine picks models, not effort - that stays a caller concern.
+- The text classifier is weak on DeepSWE (65.5% CV vs 85% majority baseline,
+  labels: 96 utility / 17 balanced / 0 frontier), but it is now calibrated: `calibrate`
+  fits a temperature (currently 8.0 - raw probabilities were extremely overconfident,
+  NLL 2.35 -> 1.21) and derives tier anchors from data (utility 0.608, balanced 0.688).
+  Combined with the quality gate this lifted the routed choice's pass rate from 39.7%
+  to **57.6%** on held-out tasks, with 8/34 failing outright.
+- Reasoning `effort` is part of every decision: low for utility, medium for
+  balanced/frontier, overridable per tier or per model. Benchmark runs used max effort;
+  production defaults stay cost-conscious.
 - `min_rate` 0.5 labels a task "tier sufficient" only when a model passed at least half
   its non-errored attempts; thin trial counts make labels noisy.
 
@@ -201,23 +207,25 @@ Findings, honestly:
   "advisor":    { "<tier>": "auto" | "<provider/model>" },
   "cost_bands": { "utility": 1.5, "balanced": 15.0 },   // $/M output -> tier fallback
   "decision":   { "mode": "cost" | "balanced" | "quality",
-                  "tier_requirement": { "utility": 0.35, "balanced": 0.6, "frontier": 0.8 },
+                  "tier_requirement": { "utility": 0.35, "balanced": 0.6, "frontier": 0.8 },  // optional; calibrated anchors win if absent
                   "signal_rules": { "user_frustration": { "threshold": 0.5, "action": "escalate_advise" },
                                     "tool_error_rate": { "threshold": 0.3, "action": "escalate" } } },
+  "efforts":    { "utility": "low", "balanced": "medium", "frontier": "medium" },  // per tier or "<provider/model>"
   "classifier": { "frontier_prob": 0.45, "utility_prob": 0.55 },
   "instructions": { "base": "...", "escalation": "...", "advisor": "..." }
 }
 ```
 
-Library use (pass `quality` for mode scoring - AA indices preferred, DeepSWE pass fallback):
+Library use (pass `quality` for mode scoring - AA indices preferred, DeepSWE pass fallback -
+and `anchors` from the calibrate cache if present):
 
 ```python
 from model_router import Classifier, Router, RunStore, load_models
 
 router = Router(config, load_models(cache_dir), Classifier.load(classifier_path),
-                store=RunStore(), quality=quality_map)   # ref -> 0..1
-d = router.decide("run-42", task_text)       # {model, advisor, instructions, ...}
-# ... call d.model with d.instructions; on failure:
+                store=RunStore(), quality=quality_map, anchors=anchors)   # ref -> 0..1
+d = router.decide("run-42", task_text)       # {model, effort, advisor, instructions, ...}
+# ... call d.model at d.effort with d.instructions; on failure:
 d = router.decide("run-42", signals={"prior_failure": True})
 ```
 
