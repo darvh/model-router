@@ -76,11 +76,28 @@ FRUSTRATION_RE = re.compile(
 )
 
 
+def _caps_score(text: str) -> float:
+    letters = [c for c in text if c.isalpha()]
+    if len(letters) < 8:
+        return 0.0
+    return 1.0 if sum(1 for c in letters if c.isupper()) / len(letters) >= 0.6 else 0.0
+
+
+def _repetition_score(a: str, b: str) -> float:
+    wa = {w for w in re.findall(r"[a-z0-9]+", (a or "").lower()) if len(w) >= 3}
+    wb = {w for w in re.findall(r"[a-z0-9]+", (b or "").lower()) if len(w) >= 3}
+    if not wa or not wb:
+        return 0.0
+    return len(wa & wb) / len(wa | wb)
+
+
 def frustration_score(messages: Sequence[str]) -> float:
     """Heuristic 0..1 user-frustration score from the most recent messages.
 
-    Optional input: the caller can pass recent user messages and forward the score as
-    the `user_frustration` signal. Not a sentiment model - just cheap, testable cues.
+    Cheap cues only: frustration phrases, shouting, ALL CAPS, and repetition of the
+    previous message (users repeating themselves is the strongest tell). Optional input:
+    the caller can forward this as the `user_frustration` signal; callers with richer
+    context (rejections, retry counts) should pass their own number instead.
     """
     recent = [m for m in (messages or []) if m][-3:]
     if not recent:
@@ -89,7 +106,9 @@ def frustration_score(messages: Sequence[str]) -> float:
     for text in recent:
         hits = len(FRUSTRATION_RE.findall(text))
         shout = 1.0 if text.count("!") >= 2 or text.count("?") >= 3 else 0.0
-        score += min(1.0, 0.4 * hits + 0.3 * shout)
+        score += min(1.0, 0.4 * hits + 0.3 * shout + 0.3 * _caps_score(text))
+    if len(recent) >= 2:
+        score += 0.5 * _repetition_score(recent[-1], recent[-2])
     return min(1.0, score / 2.0)
 
 

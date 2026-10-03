@@ -225,6 +225,11 @@ class ClassifierTests(unittest.TestCase):
 
     def test_frustration_score(self):
         self.assertGreaterEqual(frustration_score(["still not working!!", "fix it again"]), 0.5)
+        self.assertGreaterEqual(
+            frustration_score(["the pagination helper is broken", "the pagination helper is still broken"]),
+            0.5,
+        )
+        self.assertGreater(frustration_score(["FIX THE PAGINATION NOW"]), 0.0)
         self.assertEqual(frustration_score(["add a unit test"]), 0.0)
         self.assertEqual(frustration_score([]), 0.0)
 
