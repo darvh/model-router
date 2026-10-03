@@ -213,7 +213,9 @@ class EngineTests(unittest.TestCase):
 
     def test_effort_defaults_and_overrides(self):
         r = Router(CONFIG, make_models(), classifier=StubClassifier("balanced"))
-        self.assertEqual(r.decide("re1", "x").effort, "low")  # utility default
+        d = r.decide("re1", "x")
+        self.assertEqual(d.effort, "low")  # utility default
+        self.assertEqual(d.effort_params, {})  # no reasoning options in fixture
         cfg = _json.loads(_json.dumps(CONFIG))
         cfg["efforts"] = {"p/u1": "high"}
         r2 = Router(cfg, make_models(), classifier=StubClassifier("balanced"))
@@ -221,6 +223,26 @@ class EngineTests(unittest.TestCase):
         cfg["efforts"] = {"utility": "medium"}
         r3 = Router(cfg, make_models(), classifier=StubClassifier("balanced"))
         self.assertEqual(r3.decide("re3", "x").effort, "medium")
+
+    def test_effort_params_normalization(self):
+        models = make_models()
+        models["p/u1"] = Model("p/u1", "p", "u1", "U1", 0.1, 0.4, 128000, True, True, "2026-01-01",
+                               reasoning_options=[{"type": "effort", "values": ["low", "high", "max"]}])
+        models["p/u2"] = Model("p/u2", "p", "u2", "U2", 0.1, 1.0, 128000, True, True, "2026-01-01",
+                               reasoning_options=[{"type": "budget_tokens", "min": 2048}])
+        models["p/b1"] = Model("p/b1", "p", "b1", "B1", 2.0, 10.0, 128000, True, True, "2026-01-01",
+                               reasoning_options=[{"type": "toggle"}])
+        r = Router(CONFIG, models, classifier=StubClassifier("balanced"))
+        d = r.decide("rp1", "x")  # cost mode picks p/u1
+        self.assertEqual(d.effort_params, {"reasoning_effort": "low"})
+        self.assertEqual(r._resolve_effort_params("p/u1", "medium"), {"reasoning_effort": "high"})  # rounds up
+        self.assertEqual(r._resolve_effort_params("p/u2", "medium"), {"thinking_budget_tokens": 8192})
+        cfg = _json.loads(_json.dumps(CONFIG))
+        cfg["effort_budgets"] = {"medium": 5000}
+        r2 = Router(cfg, models, classifier=StubClassifier("balanced"))
+        self.assertEqual(r2._resolve_effort_params("p/u2", "medium"), {"thinking_budget_tokens": 5000})
+        self.assertEqual(r._resolve_effort_params("p/b1", "medium"), {"reasoning": True})
+        self.assertEqual(r._resolve_effort_params("p/b1", "none"), {"reasoning": False})
 
     def test_anchors_resolution(self):
         base = _json.loads(_json.dumps(CONFIG))

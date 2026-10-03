@@ -101,6 +101,7 @@ Decision shape (trimmed):
   "tier": "balanced",
   "model": "google/gemini-3.8-flash",
   "effort": "medium",
+  "effort_params": { "reasoning_effort": "medium" },
   "advisor": "openai/gpt-5.6-sol",
   "advisor_required": true,
   "advisor_reason": "escalation",
@@ -193,9 +194,15 @@ Findings, honestly:
   NLL 2.35 -> 1.21) and derives tier anchors from data (utility 0.608, balanced 0.688).
   Combined with the quality gate this lifted the routed choice's pass rate from 39.7%
   to **57.6%** on held-out tasks, with 8/34 failing outright.
-- Reasoning `effort` is part of every decision: low for utility, medium for
-  balanced/frontier, overridable per tier or per model. Benchmark runs used max effort;
-  production defaults stay cost-conscious.
+- Reasoning `effort` is part of every decision and is normalized to each model's own
+  vocabulary from models.dev `reasoning_options`: effort values (nearest match, ties
+  round up), `thinking_budget_tokens` (config `effort_budgets`, default low 1024 /
+  medium 8192 / high 32768), or a reasoning toggle. Defaults: low for utility, medium
+  for balanced/frontier - benchmark runs used max effort; production stays cost-conscious.
+- **Levers this engine controls:** model choice (tier + mode over Q/C/r), intelligence
+  (effort + model-specific params), advisor fork, escalation timing, instruction stack.
+  It does not control prompts beyond the stack, tool policy, or execution - that is the
+  caller's side.
 - `min_rate` 0.5 labels a task "tier sufficient" only when a model passed at least half
   its non-errored attempts; thin trial counts make labels noisy.
 
@@ -211,6 +218,7 @@ Findings, honestly:
                   "signal_rules": { "user_frustration": { "threshold": 0.5, "action": "escalate_advise" },
                                     "tool_error_rate": { "threshold": 0.3, "action": "escalate" } } },
   "efforts":    { "utility": "low", "balanced": "medium", "frontier": "medium" },  // per tier or "<provider/model>"
+  "effort_budgets": { "low": 1024, "medium": 8192, "high": 32768 },  // optional; for budget_tokens models
   "classifier": { "frontier_prob": 0.45, "utility_prob": 0.55 },
   "instructions": { "base": "...", "escalation": "...", "advisor": "..." }
 }

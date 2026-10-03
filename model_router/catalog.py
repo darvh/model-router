@@ -34,6 +34,7 @@ class Model:
     reasoning: bool
     released: str
     indices: Optional[Dict[str, float]] = None
+    reasoning_options: Optional[List[dict]] = None
 
     @property
     def blended_cost(self) -> float:
@@ -64,6 +65,7 @@ def load_models(cache_dir: str, force: bool = False) -> Dict[str, Model]:
                 tool_call=bool(m.get("tool_call")),
                 reasoning=bool(m.get("reasoning")),
                 released=str(m.get("release_date") or ""),
+                reasoning_options=list(m.get("reasoning_options") or []),
             )
     return models
 

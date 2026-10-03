@@ -39,6 +39,23 @@ DEFAULT_TIER_REQUIREMENT = {"utility": 0.35, "balanced": 0.6, "frontier": 0.8}
 # Default reasoning effort per tier: cost-conscious (low/medium), never benchmark-max.
 DEFAULT_EFFORTS = {"utility": "low", "balanced": "medium", "frontier": "medium"}
 
+# Canonical effort ordering for mapping abstract effort onto model-specific vocabularies.
+EFFORT_RANK = {"none": 0, "minimal": 0, "low": 1, "medium": 2, "high": 3, "xhigh": 4, "max": 5}
+
+
+def _pick_effort_value(values, effort: str):
+    """Nearest model-understood effort value: exact match, else closest rank (ties round up)."""
+    lower = [str(v).lower() for v in values]
+    if effort.lower() in lower:
+        return values[lower.index(effort.lower())]
+    target = EFFORT_RANK.get(effort.lower(), 2)
+
+    def key(v):
+        rank = EFFORT_RANK.get(str(v).lower(), 2)
+        return (abs(rank - target), 0 if rank >= target else 1)
+
+    return min(values, key=key)
+
 # Optional numeric signal rules. Fires only when the caller passes the signal;
 # config decision.signal_rules replaces this map entirely.
 DEFAULT_SIGNAL_RULES = {
@@ -54,6 +71,7 @@ class Decision:
     tier: str
     model: str
     effort: str
+    effort_params: Dict
     advisor: str
     advisor_instruction: str
     advisor_required: bool
@@ -226,12 +244,14 @@ class Router:
         stack.append(self.config["tiers"][tier].get("directive", ""))
         stack.extend(state.runtime_instructions)
         stack = [s for s in stack if s]
+        effort = self._resolve_effort(tier, model)
         return Decision(
             run_id=state.run_id,
             turn=state.turn,
             tier=tier,
             model=model,
-            effort=self._resolve_effort(tier, model),
+            effort=effort,
+            effort_params=self._resolve_effort_params(model, effort),
             advisor=self._resolve_advisor(tier, model),
             advisor_instruction=instructions.get("advisor", ""),
             advisor_required=state.advisor_required,
@@ -281,6 +301,26 @@ class Router:
 
     def _resolve_effort(self, tier: str, model: str) -> str:
         return self.efforts.get(model) or self.efforts.get(tier) or "medium"
+
+    def _resolve_effort_params(self, ref: str, effort: str) -> Dict:
+        """Abstract effort -> the model's own parameter vocabulary (from models.dev options)."""
+        m = self.models.get(ref)
+        options = (m.reasoning_options or []) if m else []
+        for opt in options:
+            if isinstance(opt, dict) and opt.get("type") == "effort" and opt.get("values"):
+                return {"reasoning_effort": _pick_effort_value(list(opt["values"]), effort)}
+        for opt in options:
+            if isinstance(opt, dict) and opt.get("type") == "budget_tokens":
+                budgets = self.config.get("effort_budgets") or {"low": 1024, "medium": 8192, "high": 32768}
+                budget = int(budgets.get(effort, budgets.get("medium", 8192)))
+                minimum = opt.get("min")
+                if isinstance(minimum, (int, float)):
+                    budget = max(budget, int(minimum))
+                return {"thinking_budget_tokens": budget}
+        for opt in options:
+            if isinstance(opt, dict) and opt.get("type") == "toggle":
+                return {"reasoning": effort.lower() not in ("none", "minimal")}
+        return {}
 
     def _score(self, ref: str, mode: str) -> float:
         """Objective score (higher better). Q in 0..1; cost normalized 0=cheap..1=pricey."""
@@ -377,6 +417,7 @@ class Router:
                     tier="",
                     model="",
                     effort="",
+                    effort_params={},
                     advisor="",
                     advisor_instruction="",
                     advisor_required=False,
