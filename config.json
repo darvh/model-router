@@ -2,25 +2,25 @@
   "tiers": {
     "utility": {
       "models": [
-        "openai/gpt-5.6-luna",
-        "google/gemini-3.5-flash-lite",
-        "deepseek/deepseek-v4-flash"
+        "deepseek/deepseek-v4-flash",
+        "zhipuai/glm-5.3-flash",
+        "openai/gpt-5.6-luna"
       ],
       "directive": "Role: utility (fast/everyday). Answer directly and deterministically: extraction, classification, formatting, small mechanical edits. Do not plan deeply or explore broadly. If the task needs multi-step reasoning, exploration, or verification beyond a quick check, say so instead of guessing."
     },
     "balanced": {
       "models": [
+        "google/gemini-3.8-flash",
         "openai/gpt-5.6-terra",
-        "anthropic/claude-sonnet-5",
-        "google/gemini-3.5-flash"
+        "zhipuai/glm-5.3"
       ],
       "directive": "Role: balanced executor. Own the work end to end: gather focused evidence, choose tools, act, verify before claiming completion. Escalate only when blocked, failing repeatedly, or the task turns out to need frontier-level reasoning."
     },
     "frontier": {
       "models": [
         "openai/gpt-5.6-sol",
-        "anthropic/claude-opus-5-5",
-        "anthropic/claude-fable-5-1"
+        "openai/gpt-6-astra",
+        "anthropic/claude-opus-5"
       ],
       "directive": "Role: frontier. Hard, novel, high-risk, or long-horizon work. Decompose explicitly, check assumptions against evidence, and verify with a runnable check. Prefer correctness over speed."
     }
@@ -33,6 +33,15 @@
   "cost_bands": {
     "utility": 1.5,
     "balanced": 15.0
+  },
+  "decision": {
+    "rule": "expected_cost",
+    "confidence_cap": 0.9,
+    "tier_costs": {
+      "utility": 0.1,
+      "balanced": 1.8,
+      "frontier": 3.84
+    }
   },
   "classifier": {
     "frontier_prob": 0.45,

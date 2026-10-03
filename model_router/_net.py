@@ -41,26 +41,21 @@ def write_json(path: str, data) -> None:
 
 
 def fetch_json_cached(url: str, path: str, max_age_hours=None, force: bool = False):
-    """Fetch JSON with an on-disk cache. max_age_hours=None means cache forever."""
+    """Fetch JSON with an on-disk cache. max_age_hours=None means cache forever.
+
+    On network failure, serve a stale cache if one exists instead of crashing.
+    """
     if not force and os.path.exists(path):
         if max_age_hours is None:
             return read_json(path)
         age_hours = (time.time() - os.path.getmtime(path)) / 3600.0
         if age_hours < max_age_hours:
             return read_json(path)
-    data = fetch_json(url)
+    try:
+        data = fetch_json(url)
+    except Exception:
+        if os.path.exists(path):
+            return read_json(path)
+        raise
     write_json(path, data)
     return data
-
-
-def fetch_text_cached(url: str, path: str, force: bool = False) -> str:
-    if not force and os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read()
-    text = fetch_bytes(url).decode("utf-8", "replace")
-    ensure_dir(path)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-    os.replace(tmp, path)
-    return text

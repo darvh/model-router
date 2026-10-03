@@ -133,9 +133,16 @@ class SoftmaxRegression:
         z = sum(exps)
         return [v / z for v in exps]
 
-    def fit(self, X: Sequence[Dict[str, float]], y: Sequence[int], class_weight: Optional[Dict[int, float]] = None):
+    def fit(
+        self,
+        X: Sequence[Dict[str, float]],
+        y: Sequence[int],
+        class_weight: Optional[Dict[int, float]] = None,
+        label_smoothing: float = 0.0,
+    ):
         rng = random.Random(self.seed)
         order = list(range(len(X)))
+        eps = max(0.0, min(label_smoothing, 0.5))
         for _epoch in range(self.epochs):
             rng.shuffle(order)
             for i in order:
@@ -143,7 +150,8 @@ class SoftmaxRegression:
                 p = self._softmax(self._scores(x))
                 cw = (class_weight or {}).get(yi, 1.0)
                 for c in range(self.n_classes):
-                    g = (p[c] - (1.0 if c == yi else 0.0)) * cw
+                    target = (1.0 - eps) if c == yi else (eps / max(1, self.n_classes - 1))
+                    g = (p[c] - target) * cw
                     self.b[c] -= self.lr * (g + self.l2 * self.b[c])
                     wc = self.w[c]
                     for f, v in x.items():
@@ -157,13 +165,25 @@ class SoftmaxRegression:
 class Classifier:
     def __init__(self, thresholds: Optional[dict] = None):
         t = {"frontier": 0.45, "utility": 0.55}
-        t.update(thresholds or {})
+        src = dict(thresholds or {})
+        if "frontier_prob" in src:
+            src["frontier"] = src.pop("frontier_prob")
+        if "utility_prob" in src:
+            src["utility"] = src.pop("utility_prob")
+        t.update(src)
         self.thresholds = t
         self.vec: Optional[Vectorizer] = None
         self.model: Optional[SoftmaxRegression] = None
         self.meta: dict = {}
 
-    def fit(self, examples: Sequence[Tuple[str, str]], epochs: int = 100, lr: float = 0.3, l2: float = 1e-3):
+    def fit(
+        self,
+        examples: Sequence[Tuple[str, str]],
+        epochs: int = 100,
+        lr: float = 0.3,
+        l2: float = 1e-3,
+        label_smoothing: float = 0.0,
+    ):
         texts = [t for t, _ in examples]
         ys = [y for _, y in examples]
         classes = [c for c in TIERS if c in set(ys)]
@@ -173,7 +193,10 @@ class Classifier:
         n = len(ys)
         class_weight = {classes.index(c): n / (len(classes) * counts[c]) for c in counts}
         self.model = SoftmaxRegression(len(classes), l2=l2, lr=lr, epochs=epochs).fit(
-            X, [classes.index(y) for y in ys], class_weight
+            X,
+            [classes.index(y) for y in ys],
+            class_weight,
+            label_smoothing=label_smoothing,
         )
         self.meta["classes"] = classes
         self.meta["trained_on"] = n
@@ -233,6 +256,7 @@ def kfold_accuracy(
     lr: float = 0.3,
     l2: float = 1e-3,
     thresholds: Optional[dict] = None,
+    label_smoothing: float = 0.0,
 ) -> Tuple[float, Counter]:
     rng = random.Random(seed)
     idx = list(range(len(examples)))
@@ -246,7 +270,7 @@ def kfold_accuracy(
         train = [examples[i] for i in idx if i not in test_idx]
         if not train:
             continue
-        clf = Classifier(thresholds).fit(train, epochs=epochs, lr=lr, l2=l2)
+        clf = Classifier(thresholds).fit(train, epochs=epochs, lr=lr, l2=l2, label_smoothing=label_smoothing)
         for i in folds[f]:
             text, y = examples[i]
             pred, _probs, _src = clf.predict(text)

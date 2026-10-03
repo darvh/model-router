@@ -71,6 +71,53 @@ def normalize_name(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
 
 
+# Prefer lab-direct providers over aggregators/gateways when resolving trial refs.
+PREFERRED_PROVIDERS = (
+    "openai",
+    "anthropic",
+    "google",
+    "deepseek",
+    "moonshotai",
+    "zhipuai",
+    "xai",
+    "alibaba",
+    "minimax",
+    "meta",
+    "mistral",
+)
+
+
+def canon(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", (s or "").lower()).strip("-")
+
+
+def build_model_index(models: Dict[str, "Model"]) -> Dict[str, List[str]]:
+    """Index models by canonical id (ignores '.' vs '-' vs '_')."""
+    idx: Dict[str, List[str]] = {}
+    for ref, m in models.items():
+        idx.setdefault(canon(m.id), []).append(ref)
+    return idx
+
+
+def resolve_ref(provider: str, model: str, models: Dict[str, "Model"], index: Optional[Dict] = None) -> Optional[str]:
+    """Map a trial (provider, model) onto a models.dev ref, tolerating naming drift.
+
+    Trial providers (vertex_ai, zai, moonshot, gemini, ...) name the serving gateway;
+    we resolve to the lab-direct ref the config uses when one exists.
+    """
+    if not model:
+        return None
+    index = index if index is not None else build_model_index(models)
+    candidates = index.get(canon(model))
+    if not candidates:
+        return None
+    for pref in PREFERRED_PROVIDERS:
+        for ref in candidates:
+            if ref.split("/", 1)[0] == pref:
+                return ref
+    return candidates[0]
+
+
 _INDEX_FIELD_RE = re.compile(r"(intelligence|coding|agentic|math)", re.I)
 
 

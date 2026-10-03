@@ -5,8 +5,8 @@ Hall/Line consume a Decision and do the calling.
 
 Semantics:
 - A run locks (sticky) to one model at its first decision.
-- Escalation signals move the run up a flat ladder: utility models, then balanced,
-  then frontier. Within-tier alternates come before the next tier.
+- Escalation signals jump to the next tier's first model; at the frontier they walk
+  the remaining frontier candidates, then stay.
 - Every decision includes the advisor model (explicit config, or the next tier up).
 - The instruction stack accumulates per run: base + current tier directive +
   caller additions + escalation notes. The caller re-sends the whole stack each call,
@@ -132,28 +132,38 @@ class Router:
                 return i
         raise ValueError("no models for tier %r" % tier)
 
+    def _tier_start_or_none(self, tier: str) -> Optional[int]:
+        for i, (t, _ref) in enumerate(self.ladder):
+            if t == tier:
+                return i
+        return None
+
     def _resolve_advisor(self, tier: str, model: str) -> str:
         declared = (self.config.get("advisor") or {}).get(tier, "auto")
         if declared != "auto":
             return declared
         idx = TIERS.index(tier) if tier in TIERS else len(TIERS) - 1
-        if idx + 1 < len(TIERS):
-            return self.ladder[self._tier_start(TIERS[idx + 1])][1]
-        for t, ref in self.ladder:  # frontier: alternate candidate if one exists
-            if t == "frontier" and ref != model:
+        for higher in TIERS[idx + 1 :]:
+            start = self._tier_start_or_none(higher)
+            if start is not None:
+                return self.ladder[start][1]
+        for t, ref in self.ladder:  # same tier: alternate candidate if one exists
+            if t == tier and ref != model:
                 return ref
         return model
 
     def _escalation_target(self, state: RunState) -> int:
-        """Next tier's first model; at frontier, the next frontier candidate; else stay."""
+        """Next tier's first model; at the frontier, the next frontier candidate; else stay."""
         tier = self.ladder[state.ladder_index][0]
-        idx = TIERS.index(tier)
-        if idx + 1 < len(TIERS):
-            return self._tier_start(TIERS[idx + 1])
+        idx = TIERS.index(tier) if tier in TIERS else len(TIERS) - 1
+        for higher in TIERS[idx + 1 :]:
+            start = self._tier_start_or_none(higher)
+            if start is not None:
+                return start
         for i, (t, _ref) in enumerate(self.ladder):
-            if t == "frontier" and i > state.ladder_index:
+            if t == tier and i > state.ladder_index:
                 return i
-        return len(self.ladder) - 1
+        return state.ladder_index
 
     def _move(self, state: RunState, new_index: int, reason: str) -> bool:
         new_index = max(0, min(new_index, len(self.ladder) - 1))
@@ -192,11 +202,37 @@ class Router:
             rationale={"classifier": state.classifier_source, "probs": state.classifier_probs},
         )
 
+    def _expected_cost_tier(self, probs: Dict[str, float]) -> Optional[str]:
+        """Cheapest expected start: E[cost | start t] with escalation only on failure.
+
+        E[utility] = cu + (pb+pf)*cb + pf*cf
+        E[balanced] = cb + pf*cf
+        E[frontier] = cf
+        """
+        costs = (self.config.get("decision") or {}).get("tier_costs") or {}
+        c = [float(costs.get(t, 0.0)) for t in TIERS]
+        if not any(c):
+            return None
+        cap = float((self.config.get("decision") or {}).get("confidence_cap", 0.9))
+        p = [min(float(probs.get(t, 0.0)), cap) for t in TIERS]
+        expected = [
+            c[0] + (p[1] + p[2]) * c[1] + p[2] * c[2],
+            c[1] + p[2] * c[2],
+            c[2],
+        ]
+        return TIERS[expected.index(min(expected))]
+
     def _initial_tier(self, task: str) -> Tuple[str, str, Dict[str, float]]:
         if self.classifier is not None and task:
             tier, probs, source = self.classifier.predict(task)
+            rule = (self.config.get("decision") or {}).get("rule", "thresholds")
+            if rule == "expected_cost":
+                override = self._expected_cost_tier(probs)
+                if override is not None:
+                    tier = override
             return tier, source, probs
-        return "balanced", "none", {}
+        default = "balanced" if self._tier_start_or_none("balanced") is not None else self.ladder[0][0]
+        return default, "none", {}
 
     # ------------------------------------------------------------------- public
 

@@ -38,11 +38,12 @@ def make_models():
 
 
 class StubClassifier:
-    def __init__(self, tier):
+    def __init__(self, tier, probs=None):
         self.tier = tier
+        self.probs = probs or {"utility": 0.1, "balanced": 0.6, "frontier": 0.3}
 
     def predict(self, text):
-        return self.tier, {"utility": 0.1, "balanced": 0.6, "frontier": 0.3}, "stub"
+        return self.tier, dict(self.probs), "stub"
 
 
 class EngineTests(unittest.TestCase):
@@ -115,6 +116,45 @@ class EngineTests(unittest.TestCase):
             r2 = Router(CONFIG, make_models(), classifier=StubClassifier("frontier"), store=RunStore(td))
             d = r2.decide("run-a", "totally different text must stay sticky")
             self.assertEqual(d.tier, "utility")
+
+    def test_expected_cost_rule(self):
+        import json as _json
+
+        cfg = _json.loads(_json.dumps(CONFIG))
+        cfg["decision"] = {
+            "rule": "expected_cost",
+            "confidence_cap": 1.0,
+            "tier_costs": {"utility": 0.1, "balanced": 1.8, "frontier": 3.84},
+        }
+        r = Router(cfg, make_models(), classifier=StubClassifier("balanced", {"utility": 0.9, "balanced": 0.1, "frontier": 0.0}))
+        self.assertEqual(r.decide("rc1", "x").tier, "utility")
+        r2 = Router(cfg, make_models(), classifier=StubClassifier("utility", {"utility": 0.05, "balanced": 0.05, "frontier": 0.9}))
+        self.assertEqual(r2.decide("rc2", "x").tier, "frontier")
+        r3 = Router(cfg, make_models(), classifier=StubClassifier("frontier", {"utility": 0.0, "balanced": 0.9, "frontier": 0.1}))
+        self.assertEqual(r3.decide("rc3", "x").tier, "balanced")
+
+    def test_confidence_cap_guards_overconfident_classifier(self):
+        import json as _json
+
+        cfg = _json.loads(_json.dumps(CONFIG))
+        cfg["decision"] = {
+            "rule": "expected_cost",
+            "confidence_cap": 0.9,
+            "tier_costs": {"utility": 0.1, "balanced": 1.8, "frontier": 3.84},
+        }
+        r = Router(cfg, make_models(), classifier=StubClassifier("balanced", {"utility": 0.0, "balanced": 1.0, "frontier": 0.0}))
+        self.assertEqual(r.decide("rc4", "x").tier, "utility")
+
+    def test_escalation_caps_at_top(self):
+        r = Router(CONFIG, make_models(), classifier=StubClassifier("balanced"))
+        r.decide("rt", "x")
+        d = r.decide("rt", signals={"prior_failure": True})  # -> frontier p/f1
+        self.assertEqual(d.model, "p/f1")
+        d = r.decide("rt", signals={"prior_failure": True})  # -> frontier alternate p/f2
+        self.assertEqual(d.model, "p/f2")
+        d = r.decide("rt", signals={"prior_failure": True})  # top: stays, no extra escalation
+        self.assertEqual(d.model, "p/f2")
+        self.assertEqual(d.escalation_count, 2)
 
     def test_missing_catalog_ref_fails_fast(self):
         with self.assertRaises(ValueError):

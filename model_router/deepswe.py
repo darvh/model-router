@@ -13,12 +13,11 @@ Endpoints discovered from the data browser frontend:
 """
 from __future__ import annotations
 
-import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Dict, List, Optional, Tuple
 
-from ._net import ensure_dir, fetch_json_cached, fetch_text_cached
+from ._net import ensure_dir, fetch_json, fetch_json_cached
 
 BASE = "https://deepswe.datacurve.ai/artifacts"
 DEFAULT_VERSION = "v1.1"
@@ -69,7 +68,7 @@ def fetch_instructions(
     workers: int = 8,
     progress: Optional[Callable[[int, int], None]] = None,
 ) -> Dict[str, str]:
-    """Fetch instruction.md text per task, cached individually."""
+    """Fetch instruction.md text per task, cached individually (extracted text only)."""
     out_dir = os.path.join(_data_dir(cache_dir, version), "instructions")
 
     def one(task_id: str) -> Tuple[str, str]:
@@ -77,16 +76,17 @@ def fetch_instructions(
         if not force and os.path.exists(path):
             with open(path, "r", encoding="utf-8") as f:
                 return task_id, f.read()
-        text = fetch_text_cached(task_url(version, task_id), path)
         try:
-            text = _instruction_from_detail(json.loads(text))
+            detail = fetch_json(task_url(version, task_id))
         except Exception:
-            text = ""
-        ensure_dir(path)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(text)
-        os.replace(tmp, path)
+            return task_id, ""
+        text = _instruction_from_detail(detail)
+        if text:
+            ensure_dir(path)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(text)
+            os.replace(tmp, path)
         return task_id, text
 
     results: Dict[str, str] = {}
@@ -104,11 +104,18 @@ def filter_source(trials: List[dict], source: str = "deep-swe") -> List[dict]:
     return [t for t in trials if t.get("source") == source]
 
 
-def model_stats(trials: List[dict], source: str = "deep-swe") -> Dict[str, dict]:
+def _default_ref_of(t: dict) -> str:
+    return "%s/%s" % (t.get("provider"), t.get("model"))
+
+
+def model_stats(
+    trials: List[dict], source: str = "deep-swe", ref_of: Optional[Callable[[dict], str]] = None
+) -> Dict[str, dict]:
     """Aggregate per model ref: pass rate, avg cost over non-errored trials."""
+    ref_of = ref_of or _default_ref_of
     acc: Dict[str, dict] = {}
     for t in filter_source(trials, source):
-        ref = "%s/%s" % (t.get("provider"), t.get("model"))
+        ref = ref_of(t)
         a = acc.setdefault(ref, {"n": 0, "passed": 0, "errored": 0, "cost_sum": 0.0, "cost_n": 0})
         a["n"] += 1
         if t.get("errored"):
@@ -131,10 +138,13 @@ def model_stats(trials: List[dict], source: str = "deep-swe") -> Dict[str, dict]
     return out
 
 
-def task_model_stats(trials: List[dict], source: str = "deep-swe") -> Dict[Tuple[str, str], dict]:
+def task_model_stats(
+    trials: List[dict], source: str = "deep-swe", ref_of: Optional[Callable[[dict], str]] = None
+) -> Dict[Tuple[str, str], dict]:
+    ref_of = ref_of or _default_ref_of
     acc: Dict[Tuple[str, str], dict] = {}
     for t in filter_source(trials, source):
-        key = (t.get("task_name"), "%s/%s" % (t.get("provider"), t.get("model")))
+        key = (t.get("task_name"), ref_of(t))
         a = acc.setdefault(key, {"n": 0, "passed": 0, "errored": 0, "cost_sum": 0.0, "cost_n": 0})
         a["n"] += 1
         if t.get("errored"):
@@ -163,14 +173,16 @@ def labels(
     tier_of: Callable[[str], Optional[str]],
     min_rate: float = 0.5,
     source: str = "deep-swe",
+    ref_of: Optional[Callable[[dict], str]] = None,
 ) -> Dict[str, str]:
     """Cheapest tier whose model reliably passed each task (fallback: any pass, then frontier)."""
+    ref_of = ref_of or _default_ref_of
     per_task: Dict[str, Dict[str, dict]] = {}
     for t in filter_source(trials, source):
         task = t.get("task_name")
         if task is None:
             continue
-        ref = "%s/%s" % (t.get("provider"), t.get("model"))
+        ref = ref_of(t)
         a = per_task.setdefault(task, {}).setdefault(ref, {"ok": 0, "passed": 0})
         if not t.get("errored"):
             a["ok"] += 1
