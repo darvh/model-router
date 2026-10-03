@@ -70,10 +70,6 @@ def load_models(cache_dir: str, force: bool = False) -> Dict[str, Model]:
     return models
 
 
-def normalize_name(s: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
-
-
 # Prefer lab-direct providers over aggregators/gateways when resolving trial refs.
 PREFERRED_PROVIDERS = (
     "openai",

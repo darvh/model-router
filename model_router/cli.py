@@ -24,8 +24,6 @@ from .catalog import (
     load_aa_indices,
     load_aa_performance,
     load_models,
-    performance_from_entry,
-    quality_from_indices,
     rank_candidates,
     resolve_ref,
     tier_of_ref,
@@ -282,32 +280,18 @@ def cmd_calibrate(args) -> None:
     print("saved:", path)
 
 
-def cmd_evaluate(args) -> None:
-    cfg = load_config(args.config)
-    models = load_models(args.cache_dir)
-    quality = build_quality(models, args.cache_dir)
-    tasks = fetch_tasks(args.cache_dir)
-    trials = fetch_trials(args.cache_dir)
-    ids = [t["id"] for t in tasks]
-    instructions = fetch_instructions(args.cache_dir, ids)
-    ref_of = make_ref_of(models)
-    stats = task_model_stats(trials, ref_of=ref_of)
-
-    def tier_of(ref):
-        return tier_of_ref(ref, cfg, models)
-
-    labs = labels(tasks, trials, tier_of, ref_of=ref_of)
-    examples = [(t["id"], instructions[t["id"]], labs[t["id"]]) for t in tasks if instructions.get(t["id"])]
-
-    rng = random.Random(args.seed)
-    rng.shuffle(examples)
-    cut = int(len(examples) * (1.0 - args.test_frac))
-    train, test = examples[:cut], examples[cut:]
+def _evaluate_once(cfg, models, examples, stats, quality, anchors, costs, outcomes, latency, test_frac, seed):
+    """One held-out evaluation at a given seed; returns metrics + policy aggregates."""
+    rng = random.Random(seed)
+    ex = list(examples)
+    rng.shuffle(ex)
+    cut = int(len(ex) * (1.0 - test_frac))
+    train, test = ex[:cut], ex[cut:]
     clf = Classifier(cfg.get("classifier")).fit(
         [(text, lab) for _tid, text, lab in train],
         label_smoothing=float((cfg.get("classifier") or {}).get("label_smoothing", 0.0)),
     )
-    router = Router(cfg, models, clf, quality=quality, anchors=_load_anchors(args.cache_dir), costs=build_costs(models, args.cache_dir), outcomes=_load_outcomes(args.cache_dir), latency=build_latency(models, args.cache_dir))
+    router = Router(cfg, models, clf, quality=quality, anchors=anchors, costs=costs, outcomes=outcomes, latency=latency)
 
     tier_match = 0
     routed_with_stats = 0
@@ -415,36 +399,97 @@ def cmd_evaluate(args) -> None:
             agg["router"]["cost"] += out[0]
             agg["router"]["succ"] += out[1]
 
-    print("policy simulation (cost USD/task, success = pass rate):")
+    return {
+        "n": len(test),
+        "train": len(train),
+        "tier_match": tier_match,
+        "routed_with_stats": routed_with_stats,
+        "pass_rates": pass_rates,
+        "unsolved": unsolved,
+        "regrets": regrets,
+        "policies": agg,
+        "rows": rows,
+    }
+
+
+def cmd_evaluate(args) -> None:
+    cfg = load_config(args.config)
+    models = load_models(args.cache_dir)
+    quality = build_quality(models, args.cache_dir)
+    tasks = fetch_tasks(args.cache_dir)
+    trials = fetch_trials(args.cache_dir)
+    ids = [t["id"] for t in tasks]
+    instructions = fetch_instructions(args.cache_dir, ids)
+    ref_of = make_ref_of(models)
+    stats = task_model_stats(trials, ref_of=ref_of)
+
+    def tier_of(ref):
+        return tier_of_ref(ref, cfg, models)
+
+    labs = labels(tasks, trials, tier_of, ref_of=ref_of)
+    examples = [(t["id"], instructions[t["id"]], labs[t["id"]]) for t in tasks if instructions.get(t["id"])]
+    anchors = _load_anchors(args.cache_dir)
+    costs = build_costs(models, args.cache_dir)
+    outcomes = _load_outcomes(args.cache_dir)
+    latency = build_latency(models, args.cache_dir)
+
+    seeds = list(range(args.seed, args.seed + max(1, args.seeds)))
+    results = [
+        _evaluate_once(cfg, models, examples, stats, quality, anchors, costs, outcomes, latency, args.test_frac, s)
+        for s in seeds
+    ]
+
+    def mean(vals):
+        return (sum(vals) / len(vals)) if vals else 0.0
+
+    def std(vals):
+        if len(vals) < 2:
+            return 0.0
+        m = mean(vals)
+        return (sum((v - m) ** 2 for v in vals) / (len(vals) - 1)) ** 0.5
+
+    n = results[0]["n"]
+    tier_accs = [r["tier_match"] / max(1, r["n"]) for r in results]
+    pass_means = [mean(r["pass_rates"]) for r in results if r["pass_rates"]]
+    unsolved = [r["unsolved"] for r in results]
+    regret_means = [mean(r["regrets"]) for r in results if r["regrets"]]
+
+    print("seeds: %s | held-out tasks/seed: %d (train %d)" % (",".join(str(s) for s in seeds), n, results[0]["train"]))
+    print("tier accuracy: %.1f%% ± %.1f%%" % (100 * mean(tier_accs), 100 * std(tier_accs)))
+    if pass_means:
+        print("routed-choice pass: %.1f%% ± %.1f%%" % (100 * mean(pass_means), 100 * std(pass_means)))
+    print("failed outright: %.1f ± %.1f per seed" % (mean(unsolved), std(unsolved)))
+    if regret_means:
+        print("cost regret (passes only): %+.3f ± %.3f USD/task" % (mean(regret_means), std(regret_means)))
+
+    print("policy simulation (mean cost/task, mean success across seeds):")
     print("  %-30s %5s %8s %8s %12s" % ("policy", "n", "cost", "success", "cost/success"))
-    for name, a in agg.items():
-        if a["n"] == 0:
+    for name in results[0]["policies"]:
+        costs_i = [r["policies"][name]["cost"] / r["policies"][name]["n"] for r in results if r["policies"][name]["n"]]
+        succ_i = [r["policies"][name]["succ"] / r["policies"][name]["n"] for r in results if r["policies"][name]["n"]]
+        if not costs_i:
             continue
-        c = a["cost"] / a["n"]
-        s = a["succ"] / a["n"]
+        c = mean(costs_i)
+        s = mean(succ_i)
         cps = (c / s) if s > 0 else float("inf")
-        print("  %-30s %5d %8.3f %7.1f%% %12.2f" % (name, a["n"], c, 100.0 * s, cps))
+        print("  %-30s %5d %8.3f %7.1f%% %12.2f" % (name, n, c, 100.0 * s, cps))
 
-    n = len(test)
-    print("held-out tasks: %d (train %d)" % (n, len(train)))
-    print("tier accuracy: %d/%d = %.1f%%" % (tier_match, n, 100.0 * tier_match / max(1, n)))
-    print("routed choices with trial data: %d/%d" % (routed_with_stats, n))
-    if pass_rates:
-        print("mean pass rate of routed choice: %.1f%%" % (100.0 * sum(pass_rates) / len(pass_rates)))
-    print("routed choices that failed outright: %d/%d" % (unsolved, n))
-    if regrets:
-        regrets_sorted = sorted(regrets)
-        print("cost regret vs cheapest-passing (USD/task, passes only): mean %.3f, median %.3f, total %.2f"
-              % (sum(regrets) / len(regrets), regrets_sorted[len(regrets) // 2], sum(regrets)))
     if args.json_out:
-        from ._net import write_json
-
         write_json(
             args.json_out,
             {
-                "summary": {"n": n, "tier_match": tier_match},
-                "policies": {k: dict(v) for k, v in agg.items()},
-                "rows": rows,
+                "seeds": seeds,
+                "summary": {
+                    "n": n,
+                    "tier_accuracy": mean(tier_accs),
+                    "tier_accuracy_std": std(tier_accs),
+                    "routed_pass": mean(pass_means),
+                    "routed_pass_std": std(pass_means),
+                    "unsolved_mean": mean(unsolved),
+                    "unsolved_std": std(unsolved),
+                },
+                "per_seed": [{k: v for k, v in r.items() if k != "rows"} for r in results],
+                "rows": results[0]["rows"],
             },
         )
         print("wrote:", args.json_out)
@@ -545,7 +590,8 @@ def main(argv=None) -> None:
     p = sub.add_parser("evaluate", help="held-out eval against DeepSWE outcomes")
     base(p)
     p.add_argument("--test-frac", type=float, default=0.3)
-    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--seed", type=int, default=0, help="base seed")
+    p.add_argument("--seeds", type=int, default=5, help="number of seeds (mean ± std reported)")
     p.add_argument("--json-out", default=None)
     p.set_defaults(func=cmd_evaluate)
 

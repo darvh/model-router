@@ -96,6 +96,7 @@ python3 -m model_router route --run-id r1 --message "still not working!!"  # fru
 python3 -m model_router route --run-id r1 --signal tool_error_rate=0.5     # tool errors -> escalate
 python3 -m model_router route --run-id r1 --signal needs_advisor    # advisor_required=true
 python3 -m model_router route --run-id r1 --signal complete         # sticky run ends
+python3 -m model_router route --run-id r1 --budget 2.0              # USD cap; escalation stops at the money line
 python3 -m model_router outcome --run-id r1 --success --cost 0.12   # feed the outcome back; priors adapt
 ```
 
@@ -112,6 +113,8 @@ Decision shape (trimmed):
   "advisor": "openai/gpt-5.6-sol",
   "advisor_required": true,
   "advisor_reason": "escalation",
+  "estimated_cost_usd": 2.11,
+  "latency": { "median_time_to_first_token_seconds": 15.31, "median_output_tokens_per_second": 239.12 },
   "sticky": true,
   "escalated": true,
   "escalation_count": 1,
@@ -173,38 +176,39 @@ New-generation models with no DeepSWE trials yet (gpt-6-luna, gpt-6-sol/6.1-sol,
 deepseek-v4.1-flash) show `-` in `rank`; the measured models behind them are the
 evidence-backed fallbacks, and the policy simulation falls through to them automatically.
 
-## Evaluation (held-out 34 tasks, real trial costs)
+## Evaluation (held-out 34 tasks/seed, 5 seeds, real trial costs)
 
 `evaluate` simulates policies with per-task measured cost and pass rates, escalation on
-failure (a failed attempt pays for the next tier). Cost per verified success = mean
-cost / mean pass rate.
+failure (a failed attempt pays for the next tier), and reports mean ± std across seeds.
+Cost per verified success = mean cost / mean pass rate. Multi-seed headline: tier
+accuracy **87.1% ± 9.4%**, routed-choice pass **51.3% ± 7.0%**, **7.0 ± 3.0** outright
+failures per seed.
 
 | policy                    | cost/task | success   | $/success |
 | ------------------------- | --------- | --------- | --------- |
-| always-utility            | $0.10     | 39.7%     | **0.25**  |
-| always-balanced           | $2.09     | 63.9%     | 3.27      |
-| always-frontier           | $3.84     | 60.7%     | 6.32      |
-| balanced→frontier         | $3.43     | 76.1%     | 4.51      |
-| utility→balanced→frontier | $2.32     | 80.5%     | 2.88      |
-| **router (this engine)**  | **$2.32** | **80.5%** | **2.88**  |
+| always-utility            | $0.10     | 51.3%     | **0.20**  |
+| always-balanced           | $2.17     | 72.4%     | 3.00      |
+| always-frontier           | $3.90     | 62.5%     | 6.23      |
+| balanced→frontier         | $3.23     | 82.7%     | 3.91      |
+| utility→balanced→frontier | $1.84     | 87.4%     | 2.11      |
+| **router (this engine)**  | **$1.84** | **87.4%** | **2.11**  |
 
 Findings, honestly:
 
 - The tier **ladder** is where the value is: cheap first attempts + escalation give both
   lower cost and higher success than any single-tier policy.
-- **Modes** score every candidate: `cost` picks the cheapest feasible (gpt-6-luna leads
-  utility today), `quality` picks max AA/DeepSWE quality, `balanced` maximizes the
-  arithmetic mean of quality and cost score. The router ties the best ladder policy
-  ($2.88 per verified success).
+- **Modes** score every candidate: `cost` picks the cheapest feasible (deepseek-v4-flash
+  leads utility at $0.10 measured $/task), `quality` picks max AA/DeepSWE quality,
+  `balanced` maximizes the arithmetic mean of quality and cost score. The router ties
+  the best ladder policy ($2.11 per verified success).
 - The text classifier is weak on DeepSWE (65.5% CV vs 85% majority baseline,
   labels: 96 utility / 17 balanced / 0 frontier), but it is calibrated: `calibrate`
   fits a temperature (currently 8.0 - raw probabilities were extremely overconfident,
   NLL 2.35 -> 1.21) and derives tier anchors from data (utility 0.608, balanced 0.688).
-- Cost mode now scores **measured $/task**, not token price: the utility pick moved
-  from glm-5.3-flash (63% pass @ $0.48) to deepseek-v4-flash (39.7% pass on this
-  held-out split @ $0.10). Raw pass rate looks lower, but cost per verified success
-  is unchanged at **$2.88** - escalation pays for the extra failures, and each attempt
-  is 5x cheaper.
+- Cost mode scores **measured $/task**, not token price: the utility pick moved from
+  glm-5.3-flash (63% pass @ $0.48) to deepseek-v4-flash (5x cheaper attempts). Raw pass
+  per attempt looks lower, but cost per verified success improves - escalation pays for
+  the extra failures.
 - Reasoning `effort` is part of every decision and is normalized to each model's own
   vocabulary from models.dev `reasoning_options`: effort values (nearest match, ties
   round up), `thinking_budget_tokens` (config `effort_budgets`, default low 1024 /
@@ -230,6 +234,7 @@ Findings, honestly:
   "cost_bands": { "utility": 1.5, "balanced": 15.0 },   // $/M output -> tier fallback
   "decision":   { "mode": "cost" | "balanced" | "quality",
                   "tier_requirement": { "utility": 0.35, "balanced": 0.6, "frontier": 0.8 },  // optional; calibrated anchors win if absent
+                  "budget_usd": null,  // optional USD cap; escalation blocked past it (advisor reason "budget")
                   "signal_rules": { "user_frustration": { "threshold": 0.5, "action": "escalate_advise" },
                                     "tool_error_rate": { "threshold": 0.3, "action": "escalate" } } },
   "efforts":    { "utility": "low", "balanced": "medium", "frontier": "medium" },  // per tier or "<provider/model>"
