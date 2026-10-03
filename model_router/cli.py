@@ -19,7 +19,9 @@ from collections import Counter
 from . import __version__
 from ._net import read_json, write_json
 from .catalog import (
+    AA_INDICES_CACHE,
     build_model_index,
+    cache_age_hours,
     canon,
     load_aa_indices,
     load_aa_performance,
@@ -140,12 +142,34 @@ def build_quality(models, cache_dir):
 def build_costs(models, cache_dir):
     """ref -> measured $/task from DeepSWE trials (real token usage), where available."""
     costs = {}
-    cached = read_json(os.path.join(cache_dir, "deepswe", DEFAULT_VERSION, "trials.json"))
-    if cached:
-        for ref, s in model_stats(cached["rows"], ref_of=make_ref_of(models)).items():
-            if s.get("avg_cost_usd") is not None:
-                costs[ref] = s["avg_cost_usd"]
+    for ref, s in _trial_stats(models, cache_dir).items():
+        if s.get("avg_cost_usd") is not None:
+            costs[ref] = s["avg_cost_usd"]
     return costs
+
+
+def _trial_stats(models, cache_dir):
+    cached = read_json(os.path.join(cache_dir, "deepswe", DEFAULT_VERSION, "trials.json"))
+    if not cached:
+        return {}
+    return model_stats(cached["rows"], ref_of=make_ref_of(models))
+
+
+def warn_stale_cache(cache_dir) -> None:
+    """Tell the caller when the data behind a decision is older than its own TTL."""
+    for name, path, ttl in (
+        ("models.dev", os.path.join(cache_dir, "models-dev.json"), 24),
+        ("artificial analysis", os.path.join(cache_dir, AA_INDICES_CACHE), 168),
+    ):
+        age = cache_age_hours(path)
+        if age is None:
+            print("stale: no %s cache at all - run: model-router refresh" % name, file=sys.stderr)
+        elif age > ttl:
+            print(
+                "stale: %s cache is %.0fh old (ttl %dh) - run: model-router refresh"
+                % (name, age, ttl),
+                file=sys.stderr,
+            )
 
 
 def build_latency(models, cache_dir):
@@ -179,6 +203,7 @@ def cmd_outcome(args) -> None:
         quality=build_quality(models, args.cache_dir),
         anchors=_load_anchors(args.cache_dir),
         costs=build_costs(models, args.cache_dir),
+       
         outcomes=_load_outcomes(args.cache_dir),
     )
     info = router.record_outcome(args.run_id, bool(args.success), cost_usd=args.cost)
@@ -430,6 +455,7 @@ def cmd_evaluate(args) -> None:
     examples = [(t["id"], instructions[t["id"]], labs[t["id"]]) for t in tasks if instructions.get(t["id"])]
     anchors = _load_anchors(args.cache_dir)
     costs = build_costs(models, args.cache_dir)
+    
     outcomes = _load_outcomes(args.cache_dir)
     latency = build_latency(models, args.cache_dir)
 
@@ -503,6 +529,7 @@ def cmd_route(args) -> None:
     store = RunStore(os.path.join(args.cache_dir, "runs"))
     anchors = _load_anchors(args.cache_dir)
     router = Router(cfg, models, clf, store, quality=quality, anchors=anchors, costs=build_costs(models, args.cache_dir), outcomes=_load_outcomes(args.cache_dir), latency=build_latency(models, args.cache_dir))
+    warn_stale_cache(args.cache_dir)
 
     task = args.task or ""
     if not task and not sys.stdin.isatty():

@@ -98,6 +98,7 @@ python3 -m model_router route --run-id r1 --signal needs_advisor    # advisor_re
 python3 -m model_router route --run-id r1 --signal complete         # sticky run ends
 python3 -m model_router route --run-id r1 --budget 2.0              # USD cap; escalation stops at the money line
 python3 -m model_router outcome --run-id r1 --success --cost 0.12   # feed the outcome back; priors adapt
+cat ~/.cache/model-router/decisions.jsonl | tail -1                # append-only decision audit log
 ```
 
 Decision shape (trimmed):
@@ -114,6 +115,7 @@ Decision shape (trimmed):
   "advisor_required": true,
   "advisor_reason": "escalation",
   "estimated_cost_usd": 2.11,
+  "cost_source": "measured",
   "latency": { "median_time_to_first_token_seconds": 15.31, "median_output_tokens_per_second": 239.12 },
   "sticky": true,
   "escalated": true,
@@ -209,15 +211,28 @@ Findings, honestly:
   glm-5.3-flash (63% pass @ $0.48) to deepseek-v4-flash (5x cheaper attempts). Raw pass
   per attempt looks lower, but cost per verified success improves - escalation pays for
   the extra failures.
+- Costs are **one unit everywhere: $/task**. Catalog price (per 1M tokens) only orders
+  models; it never becomes a dollar figure. Scaling price by a cohort token count was
+  tried and rejected - it overstated measured cost by 5-50x, because tokens per task vary
+  far more than price. An unmeasured model is unpriced (`cost_source: "unknown"`),
+  `estimated_cost_usd` is 0.0 rather than a guess, and escalating to one under a budget
+  flags `advisor_reason: "budget_unpriced"` instead of implying the cap held. Price an
+  unmeasured model via config `costs: {"<provider/model>": 0.42}`.
 - Reasoning `effort` is part of every decision and is normalized to each model's own
   vocabulary from models.dev `reasoning_options`: effort values (nearest match, ties
   round up), `thinking_budget_tokens` (config `effort_budgets`, default low 1024 /
   medium 8192 / high 32768), or a reasoning toggle. Defaults: low for utility, medium
   for balanced/frontier - benchmark runs used max effort; production stays cost-conscious.
 - **Levers this engine controls:** model choice (tier + mode over Q/C/r), intelligence
-  (effort + model-specific params), advisor fork, escalation timing, instruction stack.
-  It does not control prompts beyond the stack, tool policy, or execution - that is the
-  caller's side.
+  (effort + model-specific params), advisor fork, escalation timing, instruction stack,
+  spend cap. It does not control prompts beyond the stack, tool policy, or execution -
+  that is the caller's side.
+- **Every decision is logged** to `~/.cache/model-router/decisions.jsonl` (one JSON line:
+  run, turn, tier, model, effort, advisor, cost source, rationale, signals), so a caller
+  can audit what it was told and why. Run state is single-writer per `run_id`: writes are
+  atomic but unlocked, so two concurrent writers on one run would lose updates.
+- `route` warns on stderr when the models.dev or AA cache is older than its own TTL, since
+  silent staleness quietly biases decisions.
 - **Adaptive priors**: `outcome` records observed success/cost per (model, domain) and
   blends them into Q and C with empirical-Bayes weighting (`outcomes.prior_weight`,
   default 5). One coding win moved deepseek-v4-flash's Q 0.53 -> 0.61; one math loss
@@ -232,9 +247,10 @@ Findings, honestly:
   "tiers":      { "<tier>": { "models": [...], "directive": "..." } },
   "advisor":    { "<tier>": "auto" | "<provider/model>" },
   "cost_bands": { "utility": 1.5, "balanced": 15.0 },   // $/M output -> tier fallback
+  "costs":     { "<provider/model>": 0.42 },  // optional; $/task overrides for models with no measured trials
   "decision":   { "mode": "cost" | "balanced" | "quality",
                   "tier_requirement": { "utility": 0.35, "balanced": 0.6, "frontier": 0.8 },  // optional; calibrated anchors win if absent
-                  "budget_usd": null,  // optional USD cap; escalation blocked past it (advisor reason "budget")
+                  "budget_usd": null,  // optional $/task-run cap; escalation blocked past it (advisor reason "budget")
                   "signal_rules": { "user_frustration": { "threshold": 0.5, "action": "escalate_advise" },
                                     "tool_error_rate": { "threshold": 0.3, "action": "escalate" } } },
   "efforts":    { "utility": "low", "balanced": "medium", "frontier": "medium" },  // per tier or "<provider/model>"

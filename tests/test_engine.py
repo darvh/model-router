@@ -38,6 +38,9 @@ def make_models():
     }
 
 
+MEASURED = {"p/u1": 0.10, "p/u2": 0.30, "p/b1": 2.00, "p/f1": 5.00, "p/f2": 9.00}
+
+
 class StubClassifier:
     def __init__(self, tier, probs=None):
         self.tier = tier
@@ -295,7 +298,7 @@ class EngineTests(unittest.TestCase):
     def test_budget_blocks_escalation(self):
         cfg = _json.loads(_json.dumps(CONFIG))
         cfg["decision"] = {"mode": "cost", "budget_usd": 1.0}
-        r = Router(cfg, make_models(), classifier=StubClassifier("balanced"))
+        r = Router(cfg, make_models(), classifier=StubClassifier("balanced"), costs=MEASURED)
         r.decide("rb1", "x")  # u1
         d = r.decide("rb1", signals={"prior_failure": True})  # b1 costs more than the budget
         self.assertEqual(d.tier, "utility")
@@ -304,7 +307,7 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(d.advisor_reason, "budget")
 
     def test_budget_uses_spent(self):
-        r = Router(CONFIG, make_models(), classifier=StubClassifier("balanced"))
+        r = Router(CONFIG, make_models(), classifier=StubClassifier("balanced"), costs=MEASURED)
         r.decide("rb2", "x", budget_usd=0.5)
         d = r.decide("rb2", signals={"prior_failure": True})
         self.assertEqual(d.tier, "utility")
@@ -313,8 +316,84 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(d.escalation_count, 0)
 
     def test_estimated_cost_reported(self):
-        r = Router(CONFIG, make_models(), classifier=StubClassifier("balanced"))
+        r = Router(CONFIG, make_models(), classifier=StubClassifier("balanced"), costs=MEASURED)
         self.assertGreater(r.decide("rb3", "x").estimated_cost_usd, 0.0)
+
+    def test_cost_source_reported(self):
+        r = Router(CONFIG, make_models(), classifier=StubClassifier("balanced"), costs=MEASURED)
+        self.assertEqual(r.decide("rc1", "x").cost_source, "measured")
+        bare = Router(CONFIG, make_models(), classifier=StubClassifier("balanced"))
+        self.assertEqual(bare.decide("rc2", "x").cost_source, "unknown")
+
+    def test_cost_units_never_mix(self):
+        """Catalog price is per 1M tokens: it may order models, never pose as $/task."""
+        bare = Router(CONFIG, make_models(), classifier=StubClassifier("balanced"))
+        self.assertIsNotNone(bare._ordering_cost("p/u1"))  # ranking works with no trials
+        self.assertIsNone(bare._task_cost("p/u1"))  # ...but no dollar figure exists
+        self.assertEqual(bare.decide("rc3", "x").estimated_cost_usd, 0.0)
+        self.assertEqual(bare.decide("rc3b", "x").cost_source, "unknown")
+
+    def test_config_cost_override(self):
+        cfg = _json.loads(_json.dumps(CONFIG))
+        cfg["costs"] = {"p/b1": 4.0}
+        r = Router(cfg, make_models(), classifier=StubClassifier("balanced"))
+        self.assertEqual(r._task_cost("p/b1"), 4.0)
+        self.assertEqual(r._cost_source("p/b1"), "measured")
+
+    def test_budget_downgrades_initial_pick(self):
+        """A budget below the chosen model must move the first pick down, not fail."""
+        cfg = _json.loads(_json.dumps(CONFIG))
+        cfg["decision"] = {"mode": "quality"}
+        r = Router(cfg, make_models(), classifier=StubClassifier("frontier"), costs=MEASURED)
+        d = r.decide("rb5", "x", budget_usd=1.0)
+        self.assertLess(d.estimated_cost_usd, 100.0)
+        self.assertNotEqual(d.model, MEASURED and "p/f2")
+
+    def test_budget_unaffordable_flags_advisor(self):
+        cfg = _json.loads(_json.dumps(CONFIG))
+        cfg["decision"] = {"mode": "quality"}
+        r = Router(cfg, make_models(), classifier=StubClassifier("frontier"), costs=MEASURED)
+        d = r.decide("rb6", "x", budget_usd=0.0)
+        self.assertTrue(d.advisor_required)
+        self.assertEqual(d.advisor_reason, "budget")
+
+    def test_unpriced_model_never_blocks_a_budget(self):
+        """No $/task figure means no budget claim either way: route, don't refuse."""
+        r = Router(CONFIG, make_models(), classifier=StubClassifier("balanced"))
+        d = r.decide("rb7", "x", budget_usd=0.01)
+        self.assertFalse(d.advisor_required)
+        self.assertEqual(d.cost_source, "unknown")
+        self.assertEqual(d.estimated_cost_usd, 0.0)
+
+    def test_budget_flags_unpriced_escalation(self):
+        """Escalating to a candidate with no $/task must not imply the cap held."""
+        r = Router(CONFIG, make_models(), classifier=StubClassifier("balanced"), costs={"p/u1": 0.1})
+        d = r.decide("rb8", "x", budget_usd=5.0, signals={"prior_failure": True})
+        self.assertEqual(d.tier, "balanced")
+        self.assertEqual(d.cost_source, "unknown")
+        self.assertEqual(d.advisor_reason, "budget_unpriced")
+
+    def test_decision_log_written(self):
+        tmp = tempfile.mkdtemp()
+        store = RunStore(os.path.join(tmp, "runs"))
+        r = Router(
+            CONFIG, make_models(), classifier=StubClassifier("balanced"), store=store, costs=MEASURED
+        )
+        r.decide("rl1", "fix the parser")
+        log = os.path.join(tmp, "decisions.jsonl")
+        self.assertTrue(os.path.exists(log))
+        row = _json.loads(open(log).readline())
+        self.assertEqual(row["model"], "p/u1")
+        self.assertEqual(row["tier"], "utility")
+        self.assertEqual(row["cost_source"], "measured")
+
+    def test_cache_age_hours(self):
+        from model_router.catalog import cache_age_hours
+
+        self.assertIsNone(cache_age_hours(os.path.join(tempfile.mkdtemp(), "nope.json")))
+        fresh = os.path.join(tempfile.mkdtemp(), "fresh.json")
+        open(fresh, "w").close()
+        self.assertLess(cache_age_hours(fresh), 1.0)
 
     def test_latency_reported(self):
         r = Router(

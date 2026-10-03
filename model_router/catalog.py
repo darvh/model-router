@@ -42,6 +42,14 @@ class Model:
         return (self.cost_in + 3.0 * self.cost_out) / 4.0
 
 
+def cache_age_hours(path: str) -> Optional[float]:
+    """Age of a cache file in hours, or None if it does not exist."""
+    try:
+        return max(0.0, (time.time() - os.path.getmtime(path)) / 3600.0)
+    except OSError:
+        return None
+
+
 def load_models(cache_dir: str, force: bool = False) -> Dict[str, Model]:
     """Load models.dev catalog keyed by 'provider/id'."""
     raw = fetch_json_cached(

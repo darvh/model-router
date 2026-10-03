@@ -14,8 +14,10 @@ Semantics:
 """
 from __future__ import annotations
 
+import json
 import os
 import re
+import time
 from dataclasses import asdict, dataclass, field, fields
 from typing import Dict, List, Optional, Tuple
 
@@ -81,6 +83,7 @@ class Decision:
     escalated: bool
     escalation_count: int
     estimated_cost_usd: float
+    cost_source: str  # measured | outcomes | estimated | unknown
     latency: Dict
     sticky: bool
     closed: bool
@@ -113,7 +116,12 @@ class RunState:
 
 
 class RunStore:
-    """Run state store. Pass a directory to persist runs as JSON (CLI); else in-memory."""
+    """Run state store. Pass a directory to persist runs as JSON (CLI); else in-memory.
+
+    Single writer per run_id: writes are atomic (tmp + replace) but there is no locking,
+    so two concurrent writers on one run_id will lose updates. Distinct run_ids are
+    independent files and are safe to write in parallel.
+    """
 
     def __init__(self, directory: Optional[str] = None):
         self.directory = directory
@@ -172,7 +180,8 @@ class Router:
         self.store = store or RunStore()
         self.quality = dict(quality or {})  # ref -> 0..1 capability (AA index, DeepSWE pass)
         self.anchors = dict(anchors or {})  # calibrated tier -> required quality
-        self.costs = dict(costs or {})  # measured $/task where available; else catalog price
+        self.costs = dict(costs or {})  # measured $/task where available
+        self.costs.update(config.get("costs") or {})  # config per-task overrides, if any
         # Observed outcomes, keyed "ref|domain": {"n", "successes", "cost_sum", "cost_n"}.
         # Mutated in place by record_outcome so callers can persist the same dict.
         self.outcomes = outcomes if outcomes is not None else {}
@@ -238,26 +247,51 @@ class Router:
                 return i
         return state.ladder_index
 
+    def _cost_source(self, ref: str) -> str:
+        """Where the $/task for a ref came from: config/trials, run outcomes, or unknown."""
+        if ref in self.costs:
+            return "measured"
+        observed, count = self._observed_cost(ref)
+        if observed is not None and count > 0:
+            return "outcomes"
+        return "unknown"
+
     def _expected_chain_cost(self, index: int) -> float:
-        """Expected USD from here to the top of the ladder (quality as success proxy)."""
+        """Expected USD from here to the top of the ladder, 0.0 if unpriced.
+
+        Stops at the first unpriced step rather than guessing it, and uses capability as
+        the success proxy, so this is an order-of-magnitude figure for the measured
+        ladders, not a quote.
+        """
         total = 0.0
         fail = 1.0
         for i in range(index, min(index + 3, len(self.ladder))):
-            ref = self.ladder[i][1]
-            c = self._raw_costs.get(ref)
+            c = self._task_cost(self.ladder[i][1])
             if c is None:
                 break
             total += fail * c
-            q = self._quality_of(ref) or 0.5
+            q = self._quality_of(self.ladder[i][1]) or 0.5
             fail *= 1.0 - max(0.0, min(1.0, q))
             if fail <= 0.01:
                 break
         return round(total, 4)
 
+    def _affordable_feasible(self, state: RunState, required: float) -> Optional[str]:
+        """Cheapest ladder ref the budget allows and the quality gate accepts, if any."""
+        affordable = [
+            ref
+            for i, (_tier, ref) in enumerate(self.ladder)
+            if self._can_afford(state, i)
+            and (self._quality_of(ref) is None or float(self._quality_of(ref)) >= required)
+        ]
+        if not affordable:
+            return None
+        return min(affordable, key=lambda ref: self._costs.get(ref) if self._costs.get(ref) is not None else 1.0)
+
     def _can_afford(self, state: RunState, target_index: int) -> bool:
         if state.budget_usd is None:
             return True
-        step = self._raw_costs.get(self.ladder[target_index][1])
+        step = self._task_cost(self.ladder[target_index][1])
         if step is None:
             return True
         return (state.spent_usd + step) <= float(state.budget_usd)
@@ -270,6 +304,7 @@ class Router:
             state.advisor_required = True
             state.advisor_reason = "budget"
             return False
+        unpriced = state.budget_usd is not None and self._task_cost(self.ladder[new_index][1]) is None
         frm = self.ladder[state.ladder_index][0]
         to = self.ladder[new_index][0]
         tmpl = (self.config.get("instructions") or {}).get("escalation", "Escalation: {frm} -> {to}.")
@@ -278,7 +313,9 @@ class Router:
         state.escalated = True
         state.escalation_count += 1
         state.advisor_required = True  # failure/divergence also routes to advisor review
-        state.advisor_reason = reason or "escalation"
+        # No $/task for the new model means a set budget cannot be enforced from here on;
+        # say so rather than implying the cap held.
+        state.advisor_reason = "budget_unpriced" if unpriced else (reason or "escalation")
         return True
 
     def _snapshot(self, state: RunState, signals: Dict[str, bool]) -> Decision:
@@ -289,7 +326,7 @@ class Router:
         stack.extend(state.runtime_instructions)
         stack = [s for s in stack if s]
         effort = self._resolve_effort(tier, model)
-        return Decision(
+        decision = Decision(
             run_id=state.run_id,
             turn=state.turn,
             tier=tier,
@@ -303,6 +340,7 @@ class Router:
             escalated=state.escalated,
             escalation_count=state.escalation_count,
             estimated_cost_usd=self._expected_chain_cost(state.ladder_index),
+            cost_source=self._cost_source(model),
             latency=dict(self.latency.get(model, {})),
             sticky=not state.closed,
             closed=state.closed,
@@ -317,26 +355,77 @@ class Router:
                 "signals_applied": list(state.signals_applied),
             },
         )
+        self._log_decision(decision)
+        return decision
+
+    def _log_decision(self, d: Decision) -> None:
+        """Append one JSON line to <cache>/decisions.jsonl so a consumer can audit what it
+        was told and why. Logging must never break a decision, hence the bare except."""
+        if not self.store.directory:
+            return
+        path = os.path.join(os.path.dirname(self.store.directory), "decisions.jsonl")
+        row = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "run_id": d.run_id,
+            "turn": d.turn,
+            "tier": d.tier,
+            "model": d.model,
+            "effort": d.effort,
+            "advisor": d.advisor,
+            "advisor_required": d.advisor_required,
+            "advisor_reason": d.advisor_reason,
+            "escalated": d.escalated,
+            "estimated_cost_usd": d.estimated_cost_usd,
+            "cost_source": d.cost_source,
+            "rationale": d.rationale,
+            "signals": d.signals,
+        }
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+
+    def _task_cost(self, ref: str) -> Optional[float]:
+        """Expected $/task for one ref, or None if we have no per-task price for it.
+
+        Only two sources, both genuinely per-task: measured $/task from trials
+        (`costs`), and $/task averaged over this system's own recorded outcomes. Catalog
+        token price is per 1M tokens and never converts here: scaling it by any cohort
+        token count was tried and is off by 5-50x, because tokens per task varies far
+        more than price does. Unmeasured models stay unpriced; supply a per-task number
+        via config `costs` if you need one.
+        """
+        c = self.costs.get(ref)
+        if c is not None:
+            return float(c)
+        observed, count = self._observed_cost(ref)
+        if observed is not None and count > 0:
+            return float(observed)
+        return None
+
+    def _ordering_cost(self, ref: str) -> Optional[float]:
+        """Cost used to rank candidates: $/task when known, else catalog token price.
+
+        The price fallback only orders models; it is never used as a dollar figure for
+        budgets or cost estimates, so the two unit systems cannot mix.
+        """
+        c = self._task_cost(ref)
+        if c is not None:
+            return c
+        m = self.models.get(ref)
+        return m.blended_cost if m else None
 
     def _normalized_costs(self) -> Dict[str, Optional[float]]:
-        """Candidate cost normalized to 0..1 (cheapest -> 0) for score blending.
-
-        Prefers measured $/task (real token usage) over catalog token price.
-        """
+        """Candidate cost normalized to 0..1 (cheapest -> 0) for score blending."""
         refs = [ref for _t, ref in self.ladder]
         values = []
         for ref in refs:
-            c = self.costs.get(ref)
-            if c is None:
-                m = self.models.get(ref)
-                c = m.blended_cost if m else None
+            c = self._ordering_cost(ref)
             observed, count = self._observed_cost(ref)
-            if observed is not None:
-                if c is None:
-                    c = observed
-                else:
-                    w = self.prior_weight
-                    c = (c * w + observed * count) / (w + count)
+            if c is not None and observed is not None and count > 0:
+                w = self.prior_weight
+                c = (c * w + observed * count) / (w + count)
             values.append(c)
         known = [v for v in values if v is not None]
         lo, hi = (min(known), max(known)) if known else (0.0, 1.0)
@@ -348,7 +437,6 @@ class Router:
                 out[ref] = 0.0
             else:
                 out[ref] = (v - lo) / (hi - lo)
-        self._raw_costs = {ref: float(v) for ref, v in zip(refs, values) if v is not None}
         return out
 
     def _required_quality(self, probs: Dict[str, float]) -> float:
@@ -522,6 +610,7 @@ class Router:
                     escalated=False,
                     escalation_count=0,
                     estimated_cost_usd=0.0,
+                    cost_source="unknown",
                     latency={},
                     sticky=False,
                     closed=True,
@@ -554,6 +643,15 @@ class Router:
             budget_usd = (self.config.get("decision") or {}).get("budget_usd")
         if budget_usd is not None:
             state.budget_usd = float(budget_usd)
+        # A budget smaller than the chosen model: take the cheapest affordable feasible
+        # candidate instead. If nothing fits, keep the pick and say so (advisor decides).
+        if state.budget_usd is not None and not self._can_afford(state, state.ladder_index):
+            cheaper = self._affordable_feasible(state, state.required_quality)
+            if cheaper is not None:
+                state.ladder_index = self._ladder_index(cheaper)
+            else:
+                state.advisor_required = True
+                state.advisor_reason = "budget"
 
         if instruction:
             state.runtime_instructions.append(instruction)

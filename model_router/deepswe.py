@@ -116,7 +116,7 @@ def model_stats(
     acc: Dict[str, dict] = {}
     for t in filter_source(trials, source):
         ref = ref_of(t)
-        a = acc.setdefault(ref, {"n": 0, "passed": 0, "errored": 0, "cost_sum": 0.0, "cost_n": 0})
+        a = acc.setdefault(ref, {"n": 0, "passed": 0, "errored": 0, "cost_sum": 0.0, "cost_n": 0, "tok_sum": 0, "tok_n": 0})
         a["n"] += 1
         if t.get("errored"):
             a["errored"] += 1
@@ -127,6 +127,10 @@ def model_stats(
             if isinstance(c, (int, float)):
                 a["cost_sum"] += float(c)
                 a["cost_n"] += 1
+                tok = (t.get("n_input_tokens") or 0) + (t.get("n_output_tokens") or 0)
+                if tok > 0:
+                    a["tok_sum"] += int(tok)
+                    a["tok_n"] += 1
     out = {}
     for ref, a in acc.items():
         ok = a["n"] - a["errored"]
@@ -134,6 +138,7 @@ def model_stats(
             "n": a["n"],
             "pass_rate": (a["passed"] / ok) if ok > 0 else None,
             "avg_cost_usd": (a["cost_sum"] / a["cost_n"]) if a["cost_n"] else None,
+            "avg_tokens": (a["tok_sum"] / a["tok_n"]) if a["tok_n"] else None,
         }
     return out
 
