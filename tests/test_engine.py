@@ -234,6 +234,30 @@ class LabelsTests(unittest.TestCase):
         self.assertEqual(out["t1"], "frontier")
 
 
+    def test_modes_cost_balanced_quality(self):
+        base = _json.loads(_json.dumps(CONFIG))
+        base["decision"] = {"rule": "expected_cost", "tier_costs": {"utility": 0.1, "balanced": 1.8, "frontier": 3.84}}
+        sure_balanced = {"utility": 0.0, "balanced": 1.0, "frontier": 0.0}
+
+        r = Router(base, make_models(), classifier=StubClassifier("balanced", sure_balanced))
+        self.assertEqual(r.decide("rm1", "x").tier, "utility")  # cost: cap 0.9
+
+        cfg = _json.loads(_json.dumps(base))
+        cfg["decision"]["mode"] = "balanced"
+        r = Router(cfg, make_models(), classifier=StubClassifier("balanced", sure_balanced))
+        self.assertEqual(r.decide("rm2", "x").tier, "balanced")  # balanced: cap 0.98
+
+        cfg = _json.loads(_json.dumps(base))
+        cfg["decision"]["mode"] = "quality"
+        r = Router(cfg, make_models(), classifier=StubClassifier("utility", {"utility": 1.0, "balanced": 0.0, "frontier": 0.0}))
+        self.assertEqual(r.decide("rm3", "x").tier, "balanced")  # quality: floor balanced
+
+        cfg = _json.loads(_json.dumps(base))
+        cfg["decision"]["mode"] = "quality"
+        r = Router(cfg, make_models(), classifier=StubClassifier("frontier", {"utility": 0.05, "balanced": 0.05, "frontier": 0.9}))
+        self.assertEqual(r.decide("rm4", "x").tier, "frontier")  # quality: very sure frontier
+
+
 class RankingTests(unittest.TestCase):
     def test_value_ranking_quality_per_cost(self):
         models = make_models()

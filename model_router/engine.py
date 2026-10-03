@@ -1,7 +1,7 @@
 """Decision engine: classify -> sticky run -> escalate -> advisor -> instruction stack.
 
 This module only decides. It never calls a model and never executes a task.
-Hall/Line consume a Decision and do the calling.
+The caller (a coding agent) consumes a Decision and does the calling.
 
 Semantics:
 - A run locks (sticky) to one model at its first decision.
@@ -23,7 +23,7 @@ from ._net import read_json, write_json
 
 TIERS = ("utility", "balanced", "frontier")
 
-# Line EFFICIENCY.md signals mapped onto engine behavior.
+# Signals mapped onto engine behavior (failure/divergence escalates, etc.).
 FLOOR_SIGNALS = {
     "not_understood": "balanced",
     "planning_needs_more_tools": "balanced",
@@ -31,6 +31,13 @@ FLOOR_SIGNALS = {
 }
 ESCALATING_SIGNALS = ("prior_failure", "verification_divergence")
 ADVISOR_SIGNAL = "needs_advisor"
+
+# Objective presets over the expected-cost rule. Explicit decision.* keys win.
+MODE_DEFAULTS = {
+    "cost": {"confidence_cap": 0.9},                          # cheap starts, escalate on failure
+    "balanced": {"confidence_cap": 0.98},                     # trust the classifier when it is sure
+    "quality": {"confidence_cap": 0.98, "min_tier": "balanced"},  # never start below balanced
+}
 
 
 @dataclass
@@ -178,7 +185,7 @@ class Router:
         state.ladder_index = new_index
         state.escalated = True
         state.escalation_count += 1
-        state.advisor_required = True  # Line: failure/divergence -> advisor review as well
+        state.advisor_required = True  # failure/divergence also routes to advisor review
         state.advisor_reason = "escalation"
         return True
 
@@ -207,6 +214,13 @@ class Router:
             rationale={"classifier": state.classifier_source, "probs": state.classifier_probs},
         )
 
+    def _decision_cfg(self) -> dict:
+        d = dict(self.config.get("decision") or {})
+        preset = MODE_DEFAULTS.get(d.get("mode", "cost"), {})
+        for k, v in preset.items():
+            d.setdefault(k, v)
+        return d
+
     def _expected_cost_tier(self, probs: Dict[str, float]) -> Optional[str]:
         """Cheapest expected start: E[cost | start t] with escalation only on failure.
 
@@ -214,11 +228,12 @@ class Router:
         E[balanced] = cb + pf*cf
         E[frontier] = cf
         """
-        costs = (self.config.get("decision") or {}).get("tier_costs") or {}
+        cfg = self._decision_cfg()
+        costs = cfg.get("tier_costs") or {}
         c = [float(costs.get(t, 0.0)) for t in TIERS]
         if not any(c):
             return None
-        cap = float((self.config.get("decision") or {}).get("confidence_cap", 0.9))
+        cap = float(cfg.get("confidence_cap", 0.9))
         p = [min(float(probs.get(t, 0.0)), cap) for t in TIERS]
         expected = [
             c[0] + (p[1] + p[2]) * c[1] + p[2] * c[2],
@@ -230,11 +245,14 @@ class Router:
     def _initial_tier(self, task: str) -> Tuple[str, str, Dict[str, float]]:
         if self.classifier is not None and task:
             tier, probs, source = self.classifier.predict(task)
-            rule = (self.config.get("decision") or {}).get("rule", "thresholds")
-            if rule == "expected_cost":
+            cfg = self._decision_cfg()
+            if cfg.get("rule", "thresholds") == "expected_cost":
                 override = self._expected_cost_tier(probs)
                 if override is not None:
                     tier = override
+            floor = cfg.get("min_tier")
+            if floor and TIERS.index(tier) < TIERS.index(floor):
+                tier = floor
             return tier, source, probs
         default = "balanced" if self._tier_start_or_none("balanced") is not None else self.ladder[0][0]
         return default, "none", {}

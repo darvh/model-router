@@ -1,6 +1,6 @@
 # model-router
 
-Routing **decision engine** for Hall/Line. Given a task it decides: tier, model, advisor
+Routing **decision engine** for a coding agent. Given a task it decides: tier, model, advisor
 model, and the run's instruction stack. It never calls a model and never executes a task.
 
 - **Tiers**: `utility` (fast/everyday) → `balanced` → `frontier`.
@@ -30,7 +30,7 @@ flowchart LR
         CL -->|tier probs| X{"expected-cost rule<br/>confidence-capped"}
         RK -->|reordered tier models| X
         X --> D["decision (sticky):<br/>model + advisor + instruction stack"]
-        D --> H["Hall / Line executes it"]
+        D --> H["coding agent executes it"]
         H -->|"prior_failure, verification_divergence"| ES["escalate one tier"]
         ES --> D
         H -->|complete| Z["close run"]
@@ -43,8 +43,8 @@ Short version:
    it; those labels train the classifier.
 2. `ranking.mode: "value"` reorders each tier by measured pass rate / measured $ per
    task (unmeasured models keep place; `"config"` disables).
-3. `route` classifies the task, the expected-cost rule picks the start tier, and the
-   run locks (sticky).
+3. `route` classifies the task, the expected-cost rule picks the start tier - objective
+   mode `cost` | `balanced` | `quality` (`decision.mode`) - and the run locks (sticky).
 4. Every decision returns model + advisor + accumulating instruction stack; the caller
    executes.
 5. Failures escalate one tier and flag advisor review; `complete` ends the run.
@@ -61,6 +61,15 @@ python3 -m model_router calibrate    # train classifier on DeepSWE labels
 python3 -m model_router evaluate     # held-out eval + policy simulation
 python3 -m model_router route --run-id r1 --task "fix the pagination off-by-one"
 ```
+
+Artificial Analysis key (optional, free tier - 100 req/day):
+
+```bash
+export AA_API_KEY=your-key           # or per call: model_router refresh --aa-key your-key
+python3 -m model_router refresh      # fetches once, caches indices for 7 days
+```
+
+Keep the key in the environment, not in `config.json` - this repo is public.
 
 Route a run:
 
@@ -87,11 +96,11 @@ Decision shape (trimmed):
 }
 ```
 
-Signals (mapped from Line's EFFICIENCY.md): `prior_failure`, `verification_divergence`
+Signals: `prior_failure`, `verification_divergence`
 (escalate one tier), `not_understood`, `planning_needs_more_tools` (floor at balanced),
 `needs_exploration` (floor at frontier), `needs_advisor`, `complete`. Any escalation also
-sets `advisor_required` with `advisor_reason: "escalation"` - failure/divergence routes to
-advisor review, matching Line's playbook.
+sets `advisor_required` with `advisor_reason: "escalation"` - failure/divergence also
+routes to advisor review.
 
 ## Where the defaults come from
 
@@ -148,7 +157,7 @@ Findings, honestly:
   >94.4% sure - the mathematically correct point given the measured tier costs. Raise the
   cap to trust the classifier more, lower `cost_bands`/`tier_costs` to shift cheaper.
 - Costs and effort settings are DeepSWE-specific. DeepSWE runs use max/high reasoning
-  effort; the engine picks models, not effort - that stays a Line concern.
+  effort; the engine picks models, not effort - that stays a caller concern.
 - `min_rate` 0.5 labels a task "tier sufficient" only when a model passed at least half
   its non-errored attempts; thin trial counts make labels noisy.
 
@@ -160,14 +169,15 @@ Findings, honestly:
   "advisor":    { "<tier>": "auto" | "<provider/model>" },
   "ranking":    { "mode": "value" | "config" },        // value = order by measured pass/$ 
   "cost_bands": { "utility": 1.5, "balanced": 15.0 },   // $/M output -> tier fallback
-  "decision":   { "rule": "expected_cost", "confidence_cap": 0.9,
+  "decision":   { "mode": "cost" | "balanced" | "quality",   // objective preset
+                  "rule": "expected_cost", "confidence_cap": 0.9,
                   "tier_costs": { "utility": 0.1, "balanced": 1.8, "frontier": 3.84 } },
   "classifier": { "frontier_prob": 0.45, "utility_prob": 0.55 },
   "instructions": { "base": "...", "escalation": "...", "advisor": "..." }
 }
 ```
 
-Library use (Hall/Line):
+Library use:
 
 ```python
 from model_router import Classifier, Router, RunStore, load_models

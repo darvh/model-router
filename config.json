@@ -40,6 +40,7 @@
     "mode": "value"
   },
   "decision": {
+    "mode": "cost",
     "rule": "expected_cost",
     "confidence_cap": 0.9,
     "tier_costs": {
