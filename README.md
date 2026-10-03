@@ -43,8 +43,10 @@ Short version:
    it; those labels train the classifier, fit a probability temperature (raw probs are
    wildly overconfident), and derive tier anchors from data (median required Q per tier).
 2. Every candidate model gets a **quality number Q** (0..1): Artificial Analysis
-   index when a key is set (coding > agentic > intelligence), else DeepSWE pass rate.
-   Cost C is the catalog price, normalized across candidates.
+   index when a key is set - picked by the task's **domain** (heuristic: coding, math,
+   research, data, writing; e.g. coding tasks use the coding index, math tasks the
+   intelligence index) - else DeepSWE pass rate. Cost C is measured $/task from trials
+   when available, else the catalog price; normalized across candidates.
 3. The task gets a **required number r**: `sum(tier prob * tier anchor)`. Anchor
    priority: config `decision.tier_requirement` > calibrated anchors > defaults.
    Feasible models are `Q >= r`.
@@ -113,7 +115,8 @@ Decision shape (trimmed):
     "classifier": "trained",
     "probs": { "utility": 0.99 },
     "mode": "cost",
-    "required_quality": 0.35
+    "required_quality": 0.35,
+    "domain": "coding"
   }
 }
 ```
@@ -189,11 +192,14 @@ Findings, honestly:
   arithmetic mean of quality and cost score. The router ties the best ladder policy
   ($2.88 per verified success).
 - The text classifier is weak on DeepSWE (65.5% CV vs 85% majority baseline,
-  labels: 96 utility / 17 balanced / 0 frontier), but it is now calibrated: `calibrate`
+  labels: 96 utility / 17 balanced / 0 frontier), but it is calibrated: `calibrate`
   fits a temperature (currently 8.0 - raw probabilities were extremely overconfident,
   NLL 2.35 -> 1.21) and derives tier anchors from data (utility 0.608, balanced 0.688).
-  Combined with the quality gate this lifted the routed choice's pass rate from 39.7%
-  to **57.6%** on held-out tasks, with 8/34 failing outright.
+- Cost mode now scores **measured $/task**, not token price: the utility pick moved
+  from glm-5.3-flash (63% pass @ $0.48) to deepseek-v4-flash (39.7% pass on this
+  held-out split @ $0.10). Raw pass rate looks lower, but cost per verified success
+  is unchanged at **$2.88** - escalation pays for the extra failures, and each attempt
+  is 5x cheaper.
 - Reasoning `effort` is part of every decision and is normalized to each model's own
   vocabulary from models.dev `reasoning_options`: effort values (nearest match, ties
   round up), `thinking_budget_tokens` (config `effort_budgets`, default low 1024 /

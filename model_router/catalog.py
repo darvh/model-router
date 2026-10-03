@@ -194,15 +194,27 @@ def tier_of_ref(ref: str, config: dict, models: Dict[str, Model]) -> Optional[st
 
 AA_QUALITY_FIELDS = ("coding", "agentic", "intelligence")
 
+# Which AA index judges which task domain (first available wins).
+DOMAIN_QUALITY_PRIORITY = {
+    "coding": ("coding", "engineering", "intelligence"),
+    "math": ("intelligence", "economics", "coding"),
+    "research": ("intelligence", "strategy", "coding"),
+    "data": ("intelligence", "economics", "engineering"),
+    "writing": ("intelligence", "strategy", "coding"),
+    "general": AA_QUALITY_FIELDS,
+}
 
-def quality_from_indices(indices: Optional[Dict[str, float]]) -> Optional[float]:
-    """Capability 0..1 from AA index scores (coding > agentic > intelligence).
+
+def quality_from_indices(
+    indices: Optional[Dict[str, float]], priority: Optional[tuple] = None
+) -> Optional[float]:
+    """Capability 0..1 from AA index scores (default: coding > agentic > intelligence).
 
     AA free-endpoint indices are on a 0..100 scale (median intelligence ~12).
     """
     if not indices:
         return None
-    for field in AA_QUALITY_FIELDS:
+    for field in priority or AA_QUALITY_FIELDS:
         for key, value in indices.items():
             if "cost" in key or "price" in key:
                 continue

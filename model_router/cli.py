@@ -132,10 +132,20 @@ def build_quality(models, cache_dir):
     if aa:
         for ref, m in models.items():
             entry = aa.get(canon(m.id)) or aa.get(canon(m.name))
-            q = quality_from_indices(entry)
-            if q is not None:
-                quality[ref] = q
+            if entry:
+                quality[ref] = entry  # per-domain index dict; engine picks the domain match
     return quality
+
+
+def build_costs(models, cache_dir):
+    """ref -> measured $/task from DeepSWE trials (real token usage), where available."""
+    costs = {}
+    cached = read_json(os.path.join(cache_dir, "deepswe", DEFAULT_VERSION, "trials.json"))
+    if cached:
+        for ref, s in model_stats(cached["rows"], ref_of=make_ref_of(models)).items():
+            if s.get("avg_cost_usd") is not None:
+                costs[ref] = s["avg_cost_usd"]
+    return costs
 
 
 def _load_anchors(cache_dir):
@@ -259,7 +269,7 @@ def cmd_evaluate(args) -> None:
         [(text, lab) for _tid, text, lab in train],
         label_smoothing=float((cfg.get("classifier") or {}).get("label_smoothing", 0.0)),
     )
-    router = Router(cfg, models, clf, quality=quality, anchors=_load_anchors(args.cache_dir))
+    router = Router(cfg, models, clf, quality=quality, anchors=_load_anchors(args.cache_dir), costs=build_costs(models, args.cache_dir))
 
     tier_match = 0
     routed_with_stats = 0
@@ -358,6 +368,9 @@ def cmd_evaluate(args) -> None:
                 agg[name]["n"] += 1
                 agg[name]["cost"] += out[0]
                 agg[name]["succ"] += out[1]
+        chosen = stats.get((row["task"], row["model"]))
+        if chosen and chosen.get("pass_rate") is not None and chosen.get("avg_cost_usd") is not None:
+            reps[row["predicted_tier"]] = (row["model"], chosen)
         out = chain(reps, row["predicted_tier"], 3)
         if out:
             agg["router"]["n"] += 1
@@ -406,7 +419,7 @@ def cmd_route(args) -> None:
     clf = load_classifier(args.cache_dir)
     store = RunStore(os.path.join(args.cache_dir, "runs"))
     anchors = _load_anchors(args.cache_dir)
-    router = Router(cfg, models, clf, store, quality=quality, anchors=anchors)
+    router = Router(cfg, models, clf, store, quality=quality, anchors=anchors, costs=build_costs(models, args.cache_dir))
 
     task = args.task or ""
     if not task and not sys.stdin.isatty():

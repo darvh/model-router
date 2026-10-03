@@ -20,6 +20,8 @@ from dataclasses import asdict, dataclass, field, fields
 from typing import Dict, List, Optional, Tuple
 
 from ._net import read_json, write_json
+from .catalog import DOMAIN_QUALITY_PRIORITY, quality_from_indices
+from .classify import task_domain
 
 TIERS = ("utility", "balanced", "frontier")
 
@@ -98,6 +100,7 @@ class RunState:
     advisor_required: bool = False
     advisor_reason: str = ""
     required_quality: float = 0.0
+    domain: str = "general"
     signals_applied: List[str] = field(default_factory=list)
     runtime_instructions: List[str] = field(default_factory=list)
     classifier_source: str = "none"
@@ -155,6 +158,7 @@ class Router:
         quality: Optional[Dict[str, float]] = None,
         anchors: Optional[Dict[str, float]] = None,
         efforts: Optional[Dict[str, str]] = None,
+        costs: Optional[Dict[str, float]] = None,
     ):
         self.config = config
         self.models = models or {}
@@ -162,6 +166,7 @@ class Router:
         self.store = store or RunStore()
         self.quality = dict(quality or {})  # ref -> 0..1 capability (AA index, DeepSWE pass)
         self.anchors = dict(anchors or {})  # calibrated tier -> required quality
+        self.costs = dict(costs or {})  # measured $/task where available; else catalog price
         self.efforts = dict(DEFAULT_EFFORTS)
         self.efforts.update(efforts or {})
         self.efforts.update(config.get("efforts") or {})  # config wins over defaults/injected
@@ -267,17 +272,24 @@ class Router:
                 "probs": state.classifier_probs,
                 "mode": (self.config.get("decision") or {}).get("mode", "cost"),
                 "required_quality": state.required_quality,
+                "domain": state.domain,
                 "signals_applied": list(state.signals_applied),
             },
         )
 
     def _normalized_costs(self) -> Dict[str, Optional[float]]:
-        """Candidate cost normalized to 0..1 (cheapest -> 0) for score blending."""
+        """Candidate cost normalized to 0..1 (cheapest -> 0) for score blending.
+
+        Prefers measured $/task (real token usage) over catalog token price.
+        """
         refs = [ref for _t, ref in self.ladder]
         values = []
         for ref in refs:
-            m = self.models.get(ref)
-            values.append(m.blended_cost if m else None)
+            c = self.costs.get(ref)
+            if c is None:
+                m = self.models.get(ref)
+                c = m.blended_cost if m else None
+            values.append(c)
         known = [v for v in values if v is not None]
         lo, hi = (min(known), max(known)) if known else (0.0, 1.0)
         out: Dict[str, Optional[float]] = {}
@@ -322,9 +334,21 @@ class Router:
                 return {"reasoning": effort.lower() not in ("none", "minimal")}
         return {}
 
-    def _score(self, ref: str, mode: str) -> float:
+    def _quality_of(self, ref: str, domain: str = "general") -> Optional[float]:
+        """Capability 0..1 for a candidate in the task's domain.
+
+        quality may be a flat float (DeepSWE pass / injected) or a raw AA index dict.
+        """
+        entry = self.quality.get(ref)
+        if entry is None:
+            return None
+        if isinstance(entry, (int, float)) and not isinstance(entry, bool):
+            return float(entry)
+        return quality_from_indices(entry, priority=DOMAIN_QUALITY_PRIORITY.get(domain))
+
+    def _score(self, ref: str, mode: str, domain: str = "general") -> float:
         """Objective score (higher better). Q in 0..1; cost normalized 0=cheap..1=pricey."""
-        q = self.quality.get(ref)
+        q = self._quality_of(ref, domain)
         qn = 0.5 if q is None else max(0.0, min(1.0, float(q)))
         c = self._costs.get(ref)
         cn = 0.5 if c is None else float(c)
@@ -334,7 +358,7 @@ class Router:
             return (qn + (1.0 - cn)) / 2.0  # arithmetic mean of quality and cost score
         return 1.0 - cn  # cost
 
-    def _select_initial(self, probs: Dict[str, float]) -> Tuple[str, float]:
+    def _select_initial(self, probs: Dict[str, float], domain: str = "general") -> Tuple[str, float]:
         """Pick the start model per objective mode.
 
         required r = sum(tier prob * tier anchor); feasible set = Q >= r.
@@ -344,12 +368,15 @@ class Router:
         mode = (self.config.get("decision") or {}).get("mode", "cost")
         required = self._required_quality(probs)
         refs = [ref for _t, ref in self.ladder]
-        known = [ref for ref in refs if self.quality.get(ref) is not None]
+        known = [ref for ref in refs if self._quality_of(ref, domain) is not None]
         if mode in ("quality", "balanced") and known:
             refs = known
-        feasible = [ref for ref in refs if self.quality.get(ref) is None or float(self.quality[ref]) >= required]
+        feasible = [
+            ref for ref in refs
+            if self._quality_of(ref, domain) is None or float(self._quality_of(ref, domain)) >= required
+        ]
         pool = feasible or refs
-        best = max(pool, key=lambda ref: (self._score(ref, mode), -(self._costs.get(ref) or 0.0)))
+        best = max(pool, key=lambda ref: (self._score(ref, mode, domain), -(self._costs.get(ref) or 0.0)))
         return best, required
 
     def _ladder_index(self, ref: str) -> int:
@@ -428,7 +455,7 @@ class Router:
                     closed=True,
                     instructions=[base] if base else [],
                     signals=signals,
-                    rationale={"classifier": "none", "probs": {}, "mode": (self.config.get("decision") or {}).get("mode", "cost"), "required_quality": 0.0, "signals_applied": []},
+                    rationale={"classifier": "none", "probs": {}, "mode": (self.config.get("decision") or {}).get("mode", "cost"), "required_quality": 0.0, "domain": "general", "signals_applied": []},
                 )
             state.closed = True
             state.turn += 1
@@ -440,13 +467,15 @@ class Router:
             source = "none"
             if self.classifier is not None and task:
                 _tier, probs, source = self.classifier.predict(task)
-            model, required = self._select_initial(probs)
+            domain = task_domain(task) if task else "general"
+            model, required = self._select_initial(probs, domain)
             state = RunState(
                 run_id=run_id,
                 ladder_index=self._ladder_index(model),
                 classifier_source=source,
                 classifier_probs=probs,
                 required_quality=required,
+                domain=domain,
             )
 
         if instruction:

@@ -75,6 +75,35 @@ FRUSTRATION_RE = re.compile(
     re.I,
 )
 
+DOMAIN_PATTERNS = (
+    ("coding", re.compile(
+        r"(```|\bdef \b|\bclass \b|\bfunction\b|\brefactor\b|\bapi\b|\bbug\b|\btests?\b|"
+        r"\bcompile\b|\brepositor|\bcommit\b|\bmerge\b|typescript|javascript|python|rust|golang|"
+        r"\bsql\b|docker|kubernetes|library|module|dependency|exception|stack trace)", re.I)),
+    ("math", re.compile(
+        r"(theorem|prove|integral|derivative|probability|equation|matrix|algebra|geometry|"
+        r"combinatorics|\bmath\b|\bproof\b)", re.I)),
+    ("research", re.compile(
+        r"(research|literature|\bsources?\b|\bcite\b|citation|survey|state of the art|"
+        r"\bpaper\b|compare .{0,24}approaches)", re.I)),
+    ("data", re.compile(
+        r"(dataset|dataframe|pandas|\bcsv\b|\betl\b|aggregate|statistics|regression|chart|"
+        r"dashboard|warehouse|sql query)", re.I)),
+    ("writing", re.compile(
+        r"(\bwrite\b|\bdraft\b|article|blog|readme|documentation|summarize|rewrite|\btone\b)", re.I)),
+)
+
+
+def task_domain(text: str) -> str:
+    """Cheap semantic domain tag: which capability index should judge this task.
+
+    Heuristic on purpose - used to pick the matching AA index for quality Q, not to
+    classify task difficulty. Falls back to 'general'.
+    """
+    scores = {name: len(rx.findall(text or "")) for name, rx in DOMAIN_PATTERNS}
+    best = max(scores, key=scores.get)
+    return best if scores[best] > 0 else "general"
+
 
 def _caps_score(text: str) -> float:
     letters = [c for c in text if c.isalpha()]

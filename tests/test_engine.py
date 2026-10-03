@@ -255,6 +255,25 @@ class EngineTests(unittest.TestCase):
         r2 = Router(base, make_models(), classifier=StubClassifier("balanced", probs), anchors=anchors)
         self.assertAlmostEqual(r2.decide("ra2", "x").rationale["required_quality"], 0.9)
 
+    def test_measured_costs_override_blended(self):
+        # u1 has a lower token price but expensive measured runs; u2 is cheaper measured
+        r = Router(
+            CONFIG, make_models(), classifier=StubClassifier("balanced"),
+            costs={"p/u1": 5.0, "p/u2": 0.01},
+        )
+        self.assertEqual(r.decide("rcost", "x").model, "p/u2")
+
+    def test_domain_quality_selection(self):
+        r = Router(CONFIG, make_models(), classifier=StubClassifier("balanced"))
+        r.quality["p/u1"] = {
+            "artificial_analysis_coding_index": 30.0,
+            "artificial_analysis_intelligence_index": 90.0,
+        }
+        self.assertAlmostEqual(r._quality_of("p/u1", "coding"), 0.3)
+        self.assertAlmostEqual(r._quality_of("p/u1", "math"), 0.9)
+        r.quality["p/u2"] = 0.55  # flat float still works
+        self.assertAlmostEqual(r._quality_of("p/u2", "coding"), 0.55)
+
     def test_escalation_caps_at_top(self):
         r = Router(CONFIG, make_models(), classifier=StubClassifier("balanced"))
         r.decide("rt", "x")  # u1
@@ -294,6 +313,14 @@ class ClassifierTests(unittest.TestCase):
         tier, _probs, source = Classifier().predict("fix a typo")
         self.assertEqual(source, "heuristic")
         self.assertIn(tier, ("utility", "balanced", "frontier"))
+
+    def test_task_domain(self):
+        from model_router.classify import task_domain
+
+        self.assertEqual(task_domain("Refactor the auth middleware and add tests"), "coding")
+        self.assertEqual(task_domain("Prove the theorem and derive the integral"), "math")
+        self.assertEqual(task_domain("Write a blog article and summarize the tone"), "writing")
+        self.assertEqual(task_domain(""), "general")
 
     def test_frustration_score(self):
         self.assertGreaterEqual(frustration_score(["still not working!!", "fix it again"]), 0.5)
@@ -416,7 +443,7 @@ class RankingTests(unittest.TestCase):
                 _json.dump(idx, f)
             models = {"p/gpt-x": Model("p/gpt-x", "p", "gpt-x", "GPT-X", 1, 2, 128000, True, True, "2026-01-01")}
             quality = build_quality(models, td)
-            self.assertAlmostEqual(quality["p/gpt-x"], 0.8)
+            self.assertAlmostEqual(quality_from_indices(quality["p/gpt-x"]), 0.8)
 
 
 class AaCacheTests(unittest.TestCase):
