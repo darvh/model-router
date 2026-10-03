@@ -19,7 +19,7 @@ model, and the run's instruction stack. It never calls a model and never execute
 ```mermaid
 flowchart LR
     subgraph Evidence["evidence loop (offline)"]
-        MD["models.dev costs"] --> RK["value ranking<br/>pass rate / $ per task"]
+        MD["models.dev costs"] --> RK["cost C (normalized)<br/>quality Q (AA / DeepSWE)"]
         DW["DeepSWE trials<br/>113 tasks, 31.6k runs"] --> LB["labels: cheapest<br/>sufficient tier"]
         DW --> RK
     end
@@ -27,7 +27,7 @@ flowchart LR
     subgraph Engine["decision engine (per run, never calls a model)"]
         T["task text"] --> CL["classifier<br/>TF-IDF + logreg"]
         LB --> CL
-        CL -->|tier probs| X{"expected-cost rule<br/>confidence-capped"}
+        CL -->|tier probs| X{"required r = sum(p * anchor)<br/>mode: cost | balanced | quality"}
         RK -->|reordered tier models| X
         X --> D["decision (sticky):<br/>model + advisor + instruction stack"]
         D --> H["coding agent executes it"]
@@ -41,14 +41,19 @@ Short version:
 
 1. `calibrate` labels each DeepSWE task with the cheapest tier that reliably solved
    it; those labels train the classifier.
-2. `ranking.mode: "value"` reorders each tier by measured pass rate / measured $ per
-   task (unmeasured models keep place; `"config"` disables).
-3. `route` classifies the task, the expected-cost rule picks the start tier - objective
-   mode `cost` | `balanced` | `quality` (`decision.mode`) - and the run locks (sticky).
-4. Every decision returns model + advisor + accumulating instruction stack; the caller
+2. Every candidate model gets a **quality number Q** (0..1): Artificial Analysis
+   index when a key is set (coding > agentic > intelligence), else DeepSWE pass rate.
+   Cost C is the catalog price, normalized across candidates.
+3. The task gets a **required number r**: `sum(tier prob * tier anchor)` from the
+   classifier's tier probabilities (`decision.tier_requirement`). Feasible models are
+   `Q >= r`.
+4. `decision.mode` picks the start model - `cost`: cheapest feasible; `quality`: max Q;
+   `balanced`: max arithmetic mean of Q and cost score `(Q + (1-C)) / 2` - and the run
+   locks (sticky).
+5. Every decision returns model + advisor + accumulating instruction stack; the caller
    executes.
-5. Failures escalate one tier and flag advisor review; `complete` ends the run.
-6. `evaluate` replays held-out tasks as policies and reports $ per verified success.
+6. Failures escalate one tier and flag advisor review; `complete` ends the run.
+7. `evaluate` replays held-out tasks as policies and reports $ per verified success.
 
 ## Quickstart
 
@@ -85,16 +90,34 @@ Decision shape (trimmed):
 
 ```json
 {
-  "run_id": "r1", "turn": 2, "tier": "balanced",
+  "run_id": "r1",
+  "turn": 2,
+  "tier": "balanced",
   "model": "google/gemini-3.8-flash",
   "advisor": "openai/gpt-5.6-sol",
-  "advisor_required": true, "advisor_reason": "escalation",
-  "sticky": true, "escalated": true,
+  "advisor_required": true,
+  "advisor_reason": "escalation",
+  "sticky": true,
+  "escalated": true,
   "escalation_count": 1,
   "instructions": ["...base...", "...tier directive...", "Escalation: utility -> balanced. ..."],
-  "rationale": {"classifier": "trained", "probs": {"utility": 0.99, "balanced": 0.01}}
+  "rationale": {
+    "classifier": "trained",
+    "probs": { "utility": 0.99 },
+    "mode": "cost",
+    "required_quality": 0.35
+  }
 }
 ```
+
+Objective modes (`decision.mode`), first principles - Q = model quality (AA index,
+fallback DeepSWE pass), C = normalized price, r = task requirement:
+
+| mode       | objective                                                                     |
+| ---------- | ----------------------------------------------------------------------------- |
+| `cost`     | cheapest model with `Q >= r` (if none, cheapest overall; escalate on failure) |
+| `quality`  | max `Q` (needs AA key or DeepSWE coverage to mean anything)                   |
+| `balanced` | max arithmetic mean `(Q + (1 - C)) / 2`                                       |
 
 Signals: `prior_failure`, `verification_divergence`
 (escalate one tier), `not_understood`, `planning_needs_more_tools` (floor at balanced),
@@ -118,11 +141,11 @@ openai/gpt-6-astra        10.00   50.00   72%
 
 Current tier combos (edit `config.json`):
 
-| tier | models | advisor |
-|---|---|---|
-| utility | gpt-6-luna, deepseek-v4-flash, glm-5.3-flash, deepseek-v4.1-flash (OpenRouter - no lab-direct entry) | auto → balanced first |
-| balanced | gpt-6.1-sol, gpt-6-sol, gemini-3.8-flash, glm-5.3 | auto → frontier first |
-| frontier | gpt-5.6-sol, gpt-6-astra, claude-opus-5 | claude-fable-5-1 |
+| tier     | models                                                                                               | advisor               |
+| -------- | ---------------------------------------------------------------------------------------------------- | --------------------- |
+| utility  | gpt-6-luna, deepseek-v4-flash, glm-5.3-flash, deepseek-v4.1-flash (OpenRouter - no lab-direct entry) | auto → balanced first |
+| balanced | gpt-6.1-sol, gpt-6-sol, gemini-3.8-flash, glm-5.3                                                    | auto → frontier first |
+| frontier | gpt-5.6-sol, gpt-6-astra, claude-opus-5                                                              | claude-fable-5-1      |
 
 New-generation models with no DeepSWE trials yet (gpt-6-luna, gpt-6-sol/6.1-sol,
 deepseek-v4.1-flash) show `-` in `rank`; the measured models behind them are the
@@ -134,28 +157,27 @@ evidence-backed fallbacks, and the policy simulation falls through to them autom
 failure (a failed attempt pays for the next tier). Cost per verified success = mean
 cost / mean pass rate.
 
-| policy | cost/task | success | $/success |
-|---|---|---|---|
-| always-utility | $0.10 | 39.7% | **0.25** |
-| always-balanced | $2.09 | 63.9% | 3.27 |
-| always-frontier | $4.02 | 59.6% | 6.74 |
-| balanced→frontier | $3.54 | 75.6% | 4.69 |
-| utility→balanced→frontier | $2.42 | 79.5% | 3.04 |
-| **router (this engine)** | **$2.42** | **79.5%** | **3.04** |
+| policy                    | cost/task | success   | $/success |
+| ------------------------- | --------- | --------- | --------- |
+| always-utility            | $0.10     | 39.7%     | **0.25**  |
+| always-balanced           | $2.09     | 63.9%     | 3.27      |
+| always-frontier           | $3.84     | 60.7%     | 6.32      |
+| balanced→frontier         | $3.43     | 76.1%     | 4.51      |
+| utility→balanced→frontier | $2.32     | 80.5%     | 2.88      |
+| **router (this engine)**  | **$2.32** | **80.5%** | **2.88**  |
 
 Findings, honestly:
 
 - The tier **ladder** is where the value is: cheap first attempts + escalation give both
   lower cost and higher success than any single-tier policy.
-- **Dynamic ranking** drives tier order from the evidence: deepseek-v4-flash leads
-  utility (53% @ $0.10/task), gemini-3.8-flash balanced, gpt-6-astra frontier. Even so
-  the router ties the best ladder policy ($3.04 per verified success); frontier picks
-  sit within noise on 34 held-out tasks (astra vs gpt-5.6-sol differ by ~1pp).
+- **Modes** score every candidate: `cost` picks the cheapest feasible (gpt-6-luna leads
+  utility today), `quality` picks max AA/DeepSWE quality, `balanced` maximizes the
+  arithmetic mean of quality and cost score. The router ties the best ladder policy
+  ($2.88 per verified success).
 - The text classifier alone is weak on DeepSWE (65.5% CV vs 85% majority baseline,
-  labels: 96 utility / 17 balanced / 0 frontier). Its raw probabilities are overconfident,
-  so `decision.confidence_cap` (0.9) prevents starts above utility unless the classifier is
-  >94.4% sure - the mathematically correct point given the measured tier costs. Raise the
-  cap to trust the classifier more, lower `cost_bands`/`tier_costs` to shift cheaper.
+  labels: 96 utility / 17 balanced / 0 frontier). It sets the required number `r`; the
+  quality gate plus escalation do the heavy lifting. Tune `tier_requirement` anchors to
+  make the gate stricter or looser.
 - Costs and effort settings are DeepSWE-specific. DeepSWE runs use max/high reasoning
   effort; the engine picks models, not effort - that stays a caller concern.
 - `min_rate` 0.5 labels a task "tier sufficient" only when a model passed at least half
@@ -167,23 +189,21 @@ Findings, honestly:
 {
   "tiers":      { "<tier>": { "models": [...], "directive": "..." } },
   "advisor":    { "<tier>": "auto" | "<provider/model>" },
-  "ranking":    { "mode": "value" | "config" },        // value = order by measured pass/$ 
   "cost_bands": { "utility": 1.5, "balanced": 15.0 },   // $/M output -> tier fallback
-  "decision":   { "mode": "cost" | "balanced" | "quality",   // objective preset
-                  "rule": "expected_cost", "confidence_cap": 0.9,
-                  "tier_costs": { "utility": 0.1, "balanced": 1.8, "frontier": 3.84 } },
+  "decision":   { "mode": "cost" | "balanced" | "quality",
+                  "tier_requirement": { "utility": 0.35, "balanced": 0.6, "frontier": 0.8 } },
   "classifier": { "frontier_prob": 0.45, "utility_prob": 0.55 },
   "instructions": { "base": "...", "escalation": "...", "advisor": "..." }
 }
 ```
 
-Library use:
+Library use (pass `quality` for mode scoring - AA indices preferred, DeepSWE pass fallback):
 
 ```python
 from model_router import Classifier, Router, RunStore, load_models
 
 router = Router(config, load_models(cache_dir), Classifier.load(classifier_path),
-                store=RunStore())            # or a directory to persist runs
+                store=RunStore(), quality=quality_map)   # ref -> 0..1
 d = router.decide("run-42", task_text)       # {model, advisor, instructions, ...}
 # ... call d.model with d.instructions; on failure:
 d = router.decide("run-42", signals={"prior_failure": True})

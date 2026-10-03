@@ -7,7 +7,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from model_router.catalog import AA_INDICES_CACHE, Model, apply_tier_ranking, load_aa_indices, rank_candidates, tier_of_ref
+from model_router.catalog import AA_INDICES_CACHE, Model, load_aa_indices, quality_from_indices, rank_candidates, tier_of_ref
 from model_router.classify import Classifier
 from model_router.deepswe import labels
 from model_router.engine import Router, RunStore
@@ -54,7 +54,7 @@ class EngineTests(unittest.TestCase):
     def test_sticky_same_model(self):
         d1 = self.router.decide("r1", "do a thing")
         d2 = self.router.decide("r1", "another turn")
-        self.assertEqual(d1.model, "p/b1")
+        self.assertEqual(d1.model, "p/u1")  # cost mode: cheapest candidate
         self.assertEqual(d2.model, d1.model)
         self.assertTrue(d2.sticky)
         self.assertEqual(d2.turn, 2)
@@ -64,10 +64,10 @@ class EngineTests(unittest.TestCase):
     def test_escalation(self):
         self.router.decide("r2", "x")
         d = self.router.decide("r2", signals={"prior_failure": True})
-        self.assertEqual(d.tier, "frontier")
-        self.assertEqual(d.model, "p/f1")
+        self.assertEqual(d.tier, "balanced")
+        self.assertEqual(d.model, "p/b1")
         self.assertEqual(d.escalation_count, 1)
-        self.assertIn("ESC balanced->frontier", d.instructions)
+        self.assertIn("ESC utility->balanced", d.instructions)
         self.assertTrue(d.advisor_required)
         self.assertEqual(d.advisor_reason, "escalation")
 
@@ -92,7 +92,7 @@ class EngineTests(unittest.TestCase):
     def test_instruction_stack(self):
         d = self.router.decide("r5", "x", instruction="first extra")
         self.assertEqual(d.instructions[0], "BASE")
-        self.assertIn("B", d.instructions)
+        self.assertIn("U", d.instructions)
         self.assertIn("first extra", d.instructions)
         self.router.add_instruction("r5", "second extra")
         d = self.router.decide("r5")
@@ -123,44 +123,39 @@ class EngineTests(unittest.TestCase):
             d = r2.decide("run-a", "totally different text must stay sticky")
             self.assertEqual(d.tier, "utility")
 
-    def test_expected_cost_rule(self):
-        import json as _json
+    def test_modes_optimize_cost_quality_balanced(self):
+        quality = {"p/u1": 0.2, "p/u2": 0.7, "p/b1": 0.95, "p/f1": 0.9, "p/f2": 0.9}
+        probs = {"utility": 0.0, "balanced": 1.0, "frontier": 0.0}  # required = 0.6
+        base = _json.loads(_json.dumps(CONFIG))
+        base["decision"] = {"mode": "cost", "tier_requirement": {"utility": 0.35, "balanced": 0.6, "frontier": 0.8}}
 
-        cfg = _json.loads(_json.dumps(CONFIG))
-        cfg["decision"] = {
-            "rule": "expected_cost",
-            "confidence_cap": 1.0,
-            "tier_costs": {"utility": 0.1, "balanced": 1.8, "frontier": 3.84},
-        }
-        r = Router(cfg, make_models(), classifier=StubClassifier("balanced", {"utility": 0.9, "balanced": 0.1, "frontier": 0.0}))
-        self.assertEqual(r.decide("rc1", "x").tier, "utility")
-        r2 = Router(cfg, make_models(), classifier=StubClassifier("utility", {"utility": 0.05, "balanced": 0.05, "frontier": 0.9}))
-        self.assertEqual(r2.decide("rc2", "x").tier, "frontier")
-        r3 = Router(cfg, make_models(), classifier=StubClassifier("frontier", {"utility": 0.0, "balanced": 0.9, "frontier": 0.1}))
-        self.assertEqual(r3.decide("rc3", "x").tier, "balanced")
+        r = Router(base, make_models(), classifier=StubClassifier("balanced", probs), quality=quality)
+        d = r.decide("rm1", "x")
+        self.assertEqual(d.model, "p/u2")  # cheapest feasible (u1 gated out by Q < r)
+        self.assertAlmostEqual(d.rationale["required_quality"], 0.6)
 
-    def test_confidence_cap_guards_overconfident_classifier(self):
-        import json as _json
+        cfg = _json.loads(_json.dumps(base))
+        cfg["decision"]["mode"] = "quality"
+        r = Router(cfg, make_models(), classifier=StubClassifier("balanced", probs), quality=quality)
+        self.assertEqual(r.decide("rm2", "x").model, "p/b1")  # max quality
 
-        cfg = _json.loads(_json.dumps(CONFIG))
-        cfg["decision"] = {
-            "rule": "expected_cost",
-            "confidence_cap": 0.9,
-            "tier_costs": {"utility": 0.1, "balanced": 1.8, "frontier": 3.84},
-        }
-        r = Router(cfg, make_models(), classifier=StubClassifier("balanced", {"utility": 0.0, "balanced": 1.0, "frontier": 0.0}))
-        self.assertEqual(r.decide("rc4", "x").tier, "utility")
+        cfg = _json.loads(_json.dumps(base))
+        cfg["decision"]["mode"] = "balanced"
+        r = Router(cfg, make_models(), classifier=StubClassifier("balanced", probs), quality=quality)
+        self.assertEqual(r.decide("rm3", "x").model, "p/b1")  # max arithmetic mean of Q and cost score
 
     def test_escalation_caps_at_top(self):
         r = Router(CONFIG, make_models(), classifier=StubClassifier("balanced"))
-        r.decide("rt", "x")
-        d = r.decide("rt", signals={"prior_failure": True})  # -> frontier p/f1
+        r.decide("rt", "x")  # u1
+        d = r.decide("rt", signals={"prior_failure": True})  # -> balanced b1
+        self.assertEqual(d.model, "p/b1")
+        d = r.decide("rt", signals={"prior_failure": True})  # -> frontier f1
         self.assertEqual(d.model, "p/f1")
-        d = r.decide("rt", signals={"prior_failure": True})  # -> frontier alternate p/f2
+        d = r.decide("rt", signals={"prior_failure": True})  # -> frontier alternate f2
         self.assertEqual(d.model, "p/f2")
         d = r.decide("rt", signals={"prior_failure": True})  # top: stays, no extra escalation
         self.assertEqual(d.model, "p/f2")
-        self.assertEqual(d.escalation_count, 2)
+        self.assertEqual(d.escalation_count, 3)
 
     def test_missing_catalog_ref_fails_fast(self):
         with self.assertRaises(ValueError):
@@ -234,30 +229,6 @@ class LabelsTests(unittest.TestCase):
         self.assertEqual(out["t1"], "frontier")
 
 
-    def test_modes_cost_balanced_quality(self):
-        base = _json.loads(_json.dumps(CONFIG))
-        base["decision"] = {"rule": "expected_cost", "tier_costs": {"utility": 0.1, "balanced": 1.8, "frontier": 3.84}}
-        sure_balanced = {"utility": 0.0, "balanced": 1.0, "frontier": 0.0}
-
-        r = Router(base, make_models(), classifier=StubClassifier("balanced", sure_balanced))
-        self.assertEqual(r.decide("rm1", "x").tier, "utility")  # cost: cap 0.9
-
-        cfg = _json.loads(_json.dumps(base))
-        cfg["decision"]["mode"] = "balanced"
-        r = Router(cfg, make_models(), classifier=StubClassifier("balanced", sure_balanced))
-        self.assertEqual(r.decide("rm2", "x").tier, "balanced")  # balanced: cap 0.98
-
-        cfg = _json.loads(_json.dumps(base))
-        cfg["decision"]["mode"] = "quality"
-        r = Router(cfg, make_models(), classifier=StubClassifier("utility", {"utility": 1.0, "balanced": 0.0, "frontier": 0.0}))
-        self.assertEqual(r.decide("rm3", "x").tier, "balanced")  # quality: floor balanced
-
-        cfg = _json.loads(_json.dumps(base))
-        cfg["decision"]["mode"] = "quality"
-        r = Router(cfg, make_models(), classifier=StubClassifier("frontier", {"utility": 0.05, "balanced": 0.05, "frontier": 0.9}))
-        self.assertEqual(r.decide("rm4", "x").tier, "frontier")  # quality: very sure frontier
-
-
 class RankingTests(unittest.TestCase):
     def test_value_ranking_quality_per_cost(self):
         models = make_models()
@@ -266,17 +237,12 @@ class RankingTests(unittest.TestCase):
         refs = [ref for ref, _c, _q in rank_candidates(["p/u1", "p/u2"], models, quality, costs)]
         self.assertEqual(refs, ["p/u2", "p/u1"])  # 1.6 vs 1.0 value
 
-    def test_unmeasured_sinks_and_config_untouched(self):
-        models = make_models()
-        quality = {"p/u1": 0.1, "p/u2": 0.8}
-        costs = {"p/u1": 0.1, "p/u2": 0.5}
-        ranked = apply_tier_ranking(CONFIG, models, quality, costs)
-        self.assertEqual(ranked["tiers"]["utility"]["models"][0], "p/u2")
-        self.assertEqual(CONFIG["tiers"]["utility"]["models"], ["p/u1", "p/u2"])
-        ghost = _json.loads(_json.dumps(CONFIG))
-        ghost["tiers"]["utility"]["models"].append("p/ghost")
-        ranked2 = apply_tier_ranking(ghost, models, quality, costs)
-        self.assertEqual(ranked2["tiers"]["utility"]["models"][-1], "p/ghost")
+    def test_quality_from_indices(self):
+        self.assertEqual(quality_from_indices({"artificial_analysis_coding_index": 81.0}), 0.81)
+        self.assertEqual(quality_from_indices({"intelligence": 0.9}), 0.9)
+        self.assertEqual(quality_from_indices({"coding": 120.0}), 1.0)
+        self.assertIsNone(quality_from_indices(None))
+        self.assertIsNone(quality_from_indices({"math": 70.0}))
 
 
 class AaCacheTests(unittest.TestCase):

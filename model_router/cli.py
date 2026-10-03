@@ -19,11 +19,11 @@ from collections import Counter
 from . import __version__
 from ._net import read_json
 from .catalog import (
-    apply_tier_ranking,
     build_model_index,
     load_aa_indices,
     load_models,
     normalize_name,
+    quality_from_indices,
     rank_candidates,
     resolve_ref,
     tier_of_ref,
@@ -71,18 +71,21 @@ def make_ref_of(models):
     return ref_of
 
 
-def _apply_ranking(cfg, models, cache_dir):
-    """Reorder tier models by measured value when ranking.mode == 'value' and trials exist."""
-    mode = (cfg.get("ranking") or {}).get("mode") or "config"
-    if mode != "value":
-        return cfg
+def build_quality(models, cache_dir):
+    """ref -> 0..1 capability: DeepSWE pass rate, overridden by AA indices when available."""
+    quality = {}
     cached = read_json(os.path.join(cache_dir, "deepswe", DEFAULT_VERSION, "trials.json"))
-    if not cached:
-        return cfg
-    stats = model_stats(cached["rows"], ref_of=make_ref_of(models))
-    quality = {ref: s["pass_rate"] for ref, s in stats.items() if s.get("pass_rate") is not None}
-    costs = {ref: s["avg_cost_usd"] for ref, s in stats.items() if s.get("avg_cost_usd") is not None}
-    return apply_tier_ranking(cfg, models, quality, costs)
+    if cached:
+        for ref, s in model_stats(cached["rows"], ref_of=make_ref_of(models)).items():
+            if s.get("pass_rate") is not None:
+                quality[ref] = s["pass_rate"]
+    aa = load_aa_indices(cache_dir)
+    if aa:
+        for ref, m in models.items():
+            q = quality_from_indices(aa.get(normalize_name(m.name)))
+            if q is not None:
+                quality[ref] = q
+    return quality
 
 
 def cmd_refresh(args) -> None:
@@ -139,7 +142,7 @@ def cmd_calibrate(args) -> None:
 def cmd_evaluate(args) -> None:
     cfg = load_config(args.config)
     models = load_models(args.cache_dir)
-    cfg = _apply_ranking(cfg, models, args.cache_dir)
+    quality = build_quality(models, args.cache_dir)
     tasks = fetch_tasks(args.cache_dir)
     trials = fetch_trials(args.cache_dir)
     ids = [t["id"] for t in tasks]
@@ -161,7 +164,7 @@ def cmd_evaluate(args) -> None:
         [(text, lab) for _tid, text, lab in train],
         label_smoothing=float((cfg.get("classifier") or {}).get("label_smoothing", 0.0)),
     )
-    router = Router(cfg, models, clf)
+    router = Router(cfg, models, clf, quality=quality)
 
     tier_match = 0
     routed_with_stats = 0
@@ -304,10 +307,10 @@ def cmd_evaluate(args) -> None:
 def cmd_route(args) -> None:
     cfg = load_config(args.config)
     models = load_models(args.cache_dir)
-    cfg = _apply_ranking(cfg, models, args.cache_dir)
+    quality = build_quality(models, args.cache_dir)
     clf = load_classifier(args.cache_dir)
     store = RunStore(os.path.join(args.cache_dir, "runs"))
-    router = Router(cfg, models, clf, store)
+    router = Router(cfg, models, clf, store, quality=quality)
 
     task = args.task or ""
     if not task and not sys.stdin.isatty():

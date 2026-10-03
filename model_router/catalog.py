@@ -201,6 +201,23 @@ def tier_of_ref(ref: str, config: dict, models: Dict[str, Model]) -> Optional[st
     return "frontier"
 
 
+AA_QUALITY_FIELDS = ("coding", "agentic", "intelligence")
+
+
+def quality_from_indices(indices: Optional[Dict[str, float]]) -> Optional[float]:
+    """Capability 0..1 from AA index scores (coding > agentic > intelligence)."""
+    if not indices:
+        return None
+    for field in AA_QUALITY_FIELDS:
+        for key, value in indices.items():
+            if field in key and isinstance(value, (int, float)) and not isinstance(value, bool):
+                q = float(value)
+                if q > 1.5:  # indices are 0..100; scale to 0..1
+                    q /= 100.0
+                return max(0.0, min(1.0, q))
+    return None
+
+
 def rank_candidates(
     refs: List[str],
     models: Dict[str, Model],
@@ -228,24 +245,3 @@ def rank_candidates(
     else:
         rows.sort(key=lambda r: r[1])
     return rows
-
-
-def apply_tier_ranking(
-    config: dict,
-    models: Dict[str, Model],
-    quality: Optional[Dict[str, float]] = None,
-    costs: Optional[Dict[str, float]] = None,
-) -> dict:
-    """Deep-copied config with each tier's models reordered by measured value.
-
-    Refs missing from the catalog keep their authored order at the end, so nothing is lost.
-    """
-    import copy
-
-    cfg = copy.deepcopy(config)
-    for _tier, spec in cfg.get("tiers", {}).items():
-        refs = list(spec.get("models") or [])
-        ranked = [ref for ref, _c, _q in rank_candidates(refs, models, quality, costs)]
-        missing = [ref for ref in refs if ref not in models]
-        spec["models"] = ranked + missing
-    return cfg

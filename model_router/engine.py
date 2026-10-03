@@ -32,12 +32,9 @@ FLOOR_SIGNALS = {
 ESCALATING_SIGNALS = ("prior_failure", "verification_divergence")
 ADVISOR_SIGNAL = "needs_advisor"
 
-# Objective presets over the expected-cost rule. Explicit decision.* keys win.
-MODE_DEFAULTS = {
-    "cost": {"confidence_cap": 0.9},                          # cheap starts, escalate on failure
-    "balanced": {"confidence_cap": 0.98},                     # trust the classifier when it is sure
-    "quality": {"confidence_cap": 0.98, "min_tier": "balanced"},  # never start below balanced
-}
+# Default capability anchors per tier (0..1 quality scale), used to turn the
+# classifier's tier probabilities into a required-quality number for the task.
+DEFAULT_TIER_REQUIREMENT = {"utility": 0.35, "balanced": 0.6, "frontier": 0.8}
 
 
 @dataclass
@@ -71,6 +68,7 @@ class RunState:
     escalation_count: int = 0
     advisor_required: bool = False
     advisor_reason: str = ""
+    required_quality: float = 0.0
     runtime_instructions: List[str] = field(default_factory=list)
     classifier_source: str = "none"
     classifier_probs: Dict[str, float] = field(default_factory=dict)
@@ -113,17 +111,26 @@ class RunStore:
 class Router:
     """Sticky-with-escalation routing decision engine."""
 
-    def __init__(self, config: dict, models: Optional[dict] = None, classifier=None, store: Optional[RunStore] = None):
+    def __init__(
+        self,
+        config: dict,
+        models: Optional[dict] = None,
+        classifier=None,
+        store: Optional[RunStore] = None,
+        quality: Optional[Dict[str, float]] = None,
+    ):
         self.config = config
         self.models = models or {}
         self.classifier = classifier
         self.store = store or RunStore()
+        self.quality = dict(quality or {})  # ref -> 0..1 capability (AA index, DeepSWE pass)
         self.ladder: List[Tuple[str, str]] = []
         for tier, spec in config["tiers"].items():
             for ref in spec["models"]:
                 self.ladder.append((tier, ref))
         if not self.ladder:
             raise ValueError("config.tiers has no models")
+        self._costs = self._normalized_costs()
         self._check_refs()
 
     def _check_refs(self) -> None:
@@ -211,51 +218,69 @@ class Router:
             closed=state.closed,
             instructions=stack,
             signals=dict(signals),
-            rationale={"classifier": state.classifier_source, "probs": state.classifier_probs},
+            rationale={
+                "classifier": state.classifier_source,
+                "probs": state.classifier_probs,
+                "mode": (self.config.get("decision") or {}).get("mode", "cost"),
+                "required_quality": state.required_quality,
+            },
         )
 
-    def _decision_cfg(self) -> dict:
-        d = dict(self.config.get("decision") or {})
-        preset = MODE_DEFAULTS.get(d.get("mode", "cost"), {})
-        for k, v in preset.items():
-            d.setdefault(k, v)
-        return d
+    def _normalized_costs(self) -> Dict[str, Optional[float]]:
+        """Candidate cost normalized to 0..1 (cheapest -> 0) for score blending."""
+        refs = [ref for _t, ref in self.ladder]
+        values = []
+        for ref in refs:
+            m = self.models.get(ref)
+            values.append(m.blended_cost if m else None)
+        known = [v for v in values if v is not None]
+        lo, hi = (min(known), max(known)) if known else (0.0, 1.0)
+        out: Dict[str, Optional[float]] = {}
+        for ref, v in zip(refs, values):
+            if v is None:
+                out[ref] = None
+            elif hi <= lo:
+                out[ref] = 0.0
+            else:
+                out[ref] = (v - lo) / (hi - lo)
+        return out
 
-    def _expected_cost_tier(self, probs: Dict[str, float]) -> Optional[str]:
-        """Cheapest expected start: E[cost | start t] with escalation only on failure.
+    def _required_quality(self, probs: Dict[str, float]) -> float:
+        """Task -> required capability number: sum(tier prob * tier anchor)."""
+        anchors = (self.config.get("decision") or {}).get("tier_requirement") or DEFAULT_TIER_REQUIREMENT
+        return sum(float(probs.get(t, 0.0)) * float(anchors.get(t, 0.0)) for t in TIERS)
 
-        E[utility] = cu + (pb+pf)*cb + pf*cf
-        E[balanced] = cb + pf*cf
-        E[frontier] = cf
+    def _score(self, ref: str, mode: str) -> float:
+        """Objective score (higher better). Q in 0..1; cost normalized 0=cheap..1=pricey."""
+        q = self.quality.get(ref)
+        qn = 0.5 if q is None else max(0.0, min(1.0, float(q)))
+        c = self._costs.get(ref)
+        cn = 0.5 if c is None else float(c)
+        if mode == "quality":
+            return qn
+        if mode == "balanced":
+            return (qn + (1.0 - cn)) / 2.0  # arithmetic mean of quality and cost score
+        return 1.0 - cn  # cost
+
+    def _select_initial(self, probs: Dict[str, float]) -> Tuple[str, float]:
+        """Pick the start model per objective mode.
+
+        required r = sum(tier prob * tier anchor); feasible set = Q >= r.
+        cost -> cheapest feasible; quality -> max Q; balanced -> max mean(Q, 1-C_norm).
         """
-        cfg = self._decision_cfg()
-        costs = cfg.get("tier_costs") or {}
-        c = [float(costs.get(t, 0.0)) for t in TIERS]
-        if not any(c):
-            return None
-        cap = float(cfg.get("confidence_cap", 0.9))
-        p = [min(float(probs.get(t, 0.0)), cap) for t in TIERS]
-        expected = [
-            c[0] + (p[1] + p[2]) * c[1] + p[2] * c[2],
-            c[1] + p[2] * c[2],
-            c[2],
-        ]
-        return TIERS[expected.index(min(expected))]
+        mode = (self.config.get("decision") or {}).get("mode", "cost")
+        required = self._required_quality(probs)
+        refs = [ref for _t, ref in self.ladder]
+        feasible = [ref for ref in refs if self.quality.get(ref) is None or float(self.quality[ref]) >= required]
+        pool = feasible or refs
+        best = max(pool, key=lambda ref: (self._score(ref, mode), -(self._costs.get(ref) or 0.0)))
+        return best, required
 
-    def _initial_tier(self, task: str) -> Tuple[str, str, Dict[str, float]]:
-        if self.classifier is not None and task:
-            tier, probs, source = self.classifier.predict(task)
-            cfg = self._decision_cfg()
-            if cfg.get("rule", "thresholds") == "expected_cost":
-                override = self._expected_cost_tier(probs)
-                if override is not None:
-                    tier = override
-            floor = cfg.get("min_tier")
-            if floor and TIERS.index(tier) < TIERS.index(floor):
-                tier = floor
-            return tier, source, probs
-        default = "balanced" if self._tier_start_or_none("balanced") is not None else self.ladder[0][0]
-        return default, "none", {}
+    def _ladder_index(self, ref: str) -> int:
+        for i, (_t, r) in enumerate(self.ladder):
+            if r == ref:
+                return i
+        raise ValueError("model not in ladder: %r" % ref)
 
     # ------------------------------------------------------------------- public
 
@@ -290,7 +315,7 @@ class Router:
                     closed=True,
                     instructions=[base] if base else [],
                     signals=signals,
-                    rationale={"classifier": "none", "probs": {}},
+                    rationale={"classifier": "none", "probs": {}, "mode": (self.config.get("decision") or {}).get("mode", "cost"), "required_quality": 0.0},
                 )
             state.closed = True
             state.turn += 1
@@ -298,12 +323,17 @@ class Router:
             return self._snapshot(state, signals)
 
         if state is None:
-            tier, source, probs = self._initial_tier(task)
+            probs: Dict[str, float] = {}
+            source = "none"
+            if self.classifier is not None and task:
+                _tier, probs, source = self.classifier.predict(task)
+            model, required = self._select_initial(probs)
             state = RunState(
                 run_id=run_id,
-                ladder_index=self._tier_start(tier),
+                ladder_index=self._ladder_index(model),
                 classifier_source=source,
                 classifier_probs=probs,
+                required_quality=required,
             )
 
         if instruction:

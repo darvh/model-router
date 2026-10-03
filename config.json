@@ -36,17 +36,12 @@
     "utility": 1.5,
     "balanced": 15.0
   },
-  "ranking": {
-    "mode": "value"
-  },
   "decision": {
     "mode": "cost",
-    "rule": "expected_cost",
-    "confidence_cap": 0.9,
-    "tier_costs": {
-      "utility": 0.1,
-      "balanced": 1.8,
-      "frontier": 3.84
+    "tier_requirement": {
+      "utility": 0.35,
+      "balanced": 0.6,
+      "frontier": 0.8
     }
   },
   "classifier": {
