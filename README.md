@@ -75,9 +75,13 @@ Current tier combos (edit `config.json`):
 
 | tier | models | advisor |
 |---|---|---|
-| utility | deepseek-v4-flash, glm-5.3-flash, gpt-5.6-luna | auto → balanced first |
-| balanced | gemini-3.8-flash, gpt-5.6-terra, glm-5.3 | auto → frontier first |
+| utility | gpt-6-luna, deepseek-v4-flash, glm-5.3-flash, deepseek-v4.1-flash (OpenRouter - no lab-direct entry) | auto → balanced first |
+| balanced | gpt-6.1-sol, gpt-6-sol, gemini-3.8-flash, glm-5.3 | auto → frontier first |
 | frontier | gpt-5.6-sol, gpt-6-astra, claude-opus-5 | claude-fable-5-1 |
+
+New-generation models with no DeepSWE trials yet (gpt-6-luna, gpt-6-sol/6.1-sol,
+deepseek-v4.1-flash) show `-` in `rank`; the measured models behind them are the
+evidence-backed fallbacks, and the policy simulation falls through to them automatically.
 
 ## Evaluation (held-out 34 tasks, real trial costs)
 

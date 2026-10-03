@@ -2,16 +2,18 @@
   "tiers": {
     "utility": {
       "models": [
+        "openai/gpt-6-luna",
         "deepseek/deepseek-v4-flash",
         "zhipuai/glm-5.3-flash",
-        "openai/gpt-5.6-luna"
+        "openrouter/deepseek/deepseek-v4.1-flash"
       ],
       "directive": "Role: utility (fast/everyday). Answer directly and deterministically: extraction, classification, formatting, small mechanical edits. Do not plan deeply or explore broadly. If the task needs multi-step reasoning, exploration, or verification beyond a quick check, say so instead of guessing."
     },
     "balanced": {
       "models": [
+        "openai/gpt-6.1-sol",
+        "openai/gpt-6-sol",
         "google/gemini-3.8-flash",
-        "openai/gpt-5.6-terra",
         "zhipuai/glm-5.3"
       ],
       "directive": "Role: balanced executor. Own the work end to end: gather focused evidence, choose tools, act, verify before claiming completion. Escalate only when blocked, failing repeatedly, or the task turns out to need frontier-level reasoning."
