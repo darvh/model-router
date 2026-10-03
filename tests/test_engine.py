@@ -292,6 +292,30 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(outcomes["p/u1|general"]["cost_n"], 1)
         self.assertIsNone(r.record_outcome("missing", success=True))
 
+    def test_budget_blocks_escalation(self):
+        cfg = _json.loads(_json.dumps(CONFIG))
+        cfg["decision"] = {"mode": "cost", "budget_usd": 1.0}
+        r = Router(cfg, make_models(), classifier=StubClassifier("balanced"))
+        r.decide("rb1", "x")  # u1
+        d = r.decide("rb1", signals={"prior_failure": True})  # b1 costs more than the budget
+        self.assertEqual(d.tier, "utility")
+        self.assertEqual(d.escalation_count, 0)
+        self.assertTrue(d.advisor_required)
+        self.assertEqual(d.advisor_reason, "budget")
+
+    def test_budget_uses_spent(self):
+        r = Router(CONFIG, make_models(), classifier=StubClassifier("balanced"))
+        r.decide("rb2", "x", budget_usd=0.5)
+        d = r.decide("rb2", signals={"prior_failure": True})
+        self.assertEqual(d.tier, "utility")
+        r.record_outcome("rb2", success=True, cost_usd=0.4)  # spend accumulates
+        d = r.decide("rb2", signals={"prior_failure": True})
+        self.assertEqual(d.escalation_count, 0)
+
+    def test_estimated_cost_reported(self):
+        r = Router(CONFIG, make_models(), classifier=StubClassifier("balanced"))
+        self.assertGreater(r.decide("rb3", "x").estimated_cost_usd, 0.0)
+
     def test_escalation_caps_at_top(self):
         r = Router(CONFIG, make_models(), classifier=StubClassifier("balanced"))
         r.decide("rt", "x")  # u1

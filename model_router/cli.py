@@ -452,7 +452,7 @@ def cmd_route(args) -> None:
     signals = _parse_signals(args.signal, args.message, cfg)
     instructions = args.instruction or []
     decision = router.decide(
-        args.run_id, task, signals=signals, instruction=instructions[0] if instructions else None
+        args.run_id, task, signals=signals, instruction=instructions[0] if instructions else None, budget_usd=args.budget
     )
     for extra in instructions[1:]:
         decision = router.add_instruction(args.run_id, extra) or decision
@@ -536,6 +536,7 @@ def main(argv=None) -> None:
     p.add_argument("--signal", action="append", default=[], help="name or name=0..1 (repeatable): prior_failure, verification_divergence, not_understood, planning_needs_more_tools, needs_exploration, needs_advisor, user_frustration, tool_error_rate, complete")
     p.add_argument("--message", action="append", default=[], help="recent user message (repeatable); auto-scores user_frustration")
     p.add_argument("--instruction", action="append", default=[], help="append to the run instruction stack")
+    p.add_argument("--budget", type=float, default=None, help="USD cap; escalation is blocked past it (advisor flagged)")
     p.set_defaults(func=cmd_route)
 
     p = sub.add_parser("outcome", help="record a run outcome for adaptive priors")

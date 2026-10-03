@@ -80,6 +80,7 @@ class Decision:
     advisor_reason: str
     escalated: bool
     escalation_count: int
+    estimated_cost_usd: float
     sticky: bool
     closed: bool
     instructions: List[str]
@@ -101,6 +102,8 @@ class RunState:
     advisor_reason: str = ""
     required_quality: float = 0.0
     domain: str = "general"
+    spent_usd: float = 0.0
+    budget_usd: Optional[float] = None
     signals_applied: List[str] = field(default_factory=list)
     runtime_instructions: List[str] = field(default_factory=list)
     classifier_source: str = "none"
@@ -232,9 +235,37 @@ class Router:
                 return i
         return state.ladder_index
 
+    def _expected_chain_cost(self, index: int) -> float:
+        """Expected USD from here to the top of the ladder (quality as success proxy)."""
+        total = 0.0
+        fail = 1.0
+        for i in range(index, min(index + 3, len(self.ladder))):
+            ref = self.ladder[i][1]
+            c = self._raw_costs.get(ref)
+            if c is None:
+                break
+            total += fail * c
+            q = self._quality_of(ref) or 0.5
+            fail *= 1.0 - max(0.0, min(1.0, q))
+            if fail <= 0.01:
+                break
+        return round(total, 4)
+
+    def _can_afford(self, state: RunState, target_index: int) -> bool:
+        if state.budget_usd is None:
+            return True
+        step = self._raw_costs.get(self.ladder[target_index][1])
+        if step is None:
+            return True
+        return (state.spent_usd + step) <= float(state.budget_usd)
+
     def _move(self, state: RunState, new_index: int, reason: str) -> bool:
         new_index = max(0, min(new_index, len(self.ladder) - 1))
         if new_index == state.ladder_index:
+            return False
+        if not self._can_afford(state, new_index):
+            state.advisor_required = True
+            state.advisor_reason = "budget"
             return False
         frm = self.ladder[state.ladder_index][0]
         to = self.ladder[new_index][0]
@@ -268,6 +299,7 @@ class Router:
             advisor_reason=state.advisor_reason,
             escalated=state.escalated,
             escalation_count=state.escalation_count,
+            estimated_cost_usd=self._expected_chain_cost(state.ladder_index),
             sticky=not state.closed,
             closed=state.closed,
             instructions=stack,
@@ -312,6 +344,7 @@ class Router:
                 out[ref] = 0.0
             else:
                 out[ref] = (v - lo) / (hi - lo)
+        self._raw_costs = {ref: float(v) for ref, v in zip(refs, values) if v is not None}
         return out
 
     def _required_quality(self, probs: Dict[str, float]) -> float:
@@ -460,6 +493,7 @@ class Router:
         task: str = "",
         signals: Optional[Dict[str, bool]] = None,
         instruction: Optional[str] = None,
+        budget_usd: Optional[float] = None,
     ) -> Decision:
         signals = {k: v for k, v in (signals or {}).items() if v not in (None, False)}
 
@@ -483,6 +517,7 @@ class Router:
                     advisor_reason="",
                     escalated=False,
                     escalation_count=0,
+                    estimated_cost_usd=0.0,
                     sticky=False,
                     closed=True,
                     instructions=[base] if base else [],
@@ -509,6 +544,11 @@ class Router:
                 required_quality=required,
                 domain=domain,
             )
+
+        if budget_usd is None:
+            budget_usd = (self.config.get("decision") or {}).get("budget_usd")
+        if budget_usd is not None:
+            state.budget_usd = float(budget_usd)
 
         if instruction:
             state.runtime_instructions.append(instruction)
@@ -581,6 +621,8 @@ class Router:
         if cost_usd is not None:
             obs["cost_sum"] = float(obs.get("cost_sum", 0.0)) + float(cost_usd)
             obs["cost_n"] = int(obs.get("cost_n", 0)) + 1
+            state.spent_usd = float(state.spent_usd or 0.0) + float(cost_usd)
+            self.store.put(state)
         return {"ref": ref, "domain": state.domain, "n": obs["n"], "successes": obs["successes"]}
 
     def state(self, run_id: str) -> Optional[RunState]:
