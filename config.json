@@ -1,0 +1,46 @@
+{
+  "tiers": {
+    "utility": {
+      "models": [
+        "openai/gpt-5.6-luna",
+        "google/gemini-3.5-flash-lite",
+        "deepseek/deepseek-v4-flash"
+      ],
+      "directive": "Role: utility (fast/everyday). Answer directly and deterministically: extraction, classification, formatting, small mechanical edits. Do not plan deeply or explore broadly. If the task needs multi-step reasoning, exploration, or verification beyond a quick check, say so instead of guessing."
+    },
+    "balanced": {
+      "models": [
+        "openai/gpt-5.6-terra",
+        "anthropic/claude-sonnet-5",
+        "google/gemini-3.5-flash"
+      ],
+      "directive": "Role: balanced executor. Own the work end to end: gather focused evidence, choose tools, act, verify before claiming completion. Escalate only when blocked, failing repeatedly, or the task turns out to need frontier-level reasoning."
+    },
+    "frontier": {
+      "models": [
+        "openai/gpt-5.6-sol",
+        "anthropic/claude-opus-5-5",
+        "anthropic/claude-fable-5-1"
+      ],
+      "directive": "Role: frontier. Hard, novel, high-risk, or long-horizon work. Decompose explicitly, check assumptions against evidence, and verify with a runnable check. Prefer correctness over speed."
+    }
+  },
+  "advisor": {
+    "utility": "auto",
+    "balanced": "auto",
+    "frontier": "anthropic/claude-fable-5-1"
+  },
+  "cost_bands": {
+    "utility": 1.5,
+    "balanced": 15.0
+  },
+  "classifier": {
+    "frontier_prob": 0.45,
+    "utility_prob": 0.55
+  },
+  "instructions": {
+    "base": "You are the executor of a single sticky run. Keep the chosen model and this instruction stack for the whole run unless an escalation replaces them.",
+    "escalation": "Escalation: this run moved {frm} -> {to}. The previous model or plan was insufficient; reassess before continuing.",
+    "advisor": "You are the advisor for this run's current decision. Review the executor's plan and evidence within your advise authority. Return: status, conclusion, recommended_plan, evidence, assumptions, risks, files_or_artifacts, verification, confidence."
+  }
+}

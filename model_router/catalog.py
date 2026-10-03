@@ -1,0 +1,170 @@
+"""Model catalog.
+
+Costs and capabilities from models.dev (open, no key).
+Optional benchmark indices from the Artificial Analysis free API (x-api-key, 100 req/day);
+the response shape is not pinned here on purpose, indices are extracted tolerantly and
+stored raw alongside so a shape change degrades to "no indices", never a crash.
+"""
+from __future__ import annotations
+
+import os
+import re
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+from ._net import fetch_json_cached, read_json, write_json
+
+MODELS_DEV_URL = "https://models.dev/api.json"
+AA_URL = "https://artificialanalysis.ai/api/v2/language/models"
+AA_CACHE = "aa-language-models.json"
+AA_INDICES_CACHE = "aa-indices.json"
+
+
+@dataclass
+class Model:
+    ref: str  # "openai/gpt-5.6-luna"
+    provider: str
+    id: str
+    name: str
+    cost_in: float  # USD per 1M input tokens
+    cost_out: float  # USD per 1M output tokens
+    context: int
+    tool_call: bool
+    reasoning: bool
+    released: str
+    indices: Optional[Dict[str, float]] = None
+
+    @property
+    def blended_cost(self) -> float:
+        """Rough ranking cost: mostly output-weighted."""
+        return (self.cost_in + 3.0 * self.cost_out) / 4.0
+
+
+def load_models(cache_dir: str, force: bool = False) -> Dict[str, Model]:
+    """Load models.dev catalog keyed by 'provider/id'."""
+    raw = fetch_json_cached(
+        MODELS_DEV_URL, os.path.join(cache_dir, "models-dev.json"), max_age_hours=24, force=force
+    )
+    models: Dict[str, Model] = {}
+    for provider_id, provider in raw.items():
+        for model_id, m in (provider.get("models") or {}).items():
+            cost = m.get("cost") or {}
+            if cost.get("input") is None or cost.get("output") is None:
+                continue
+            ref = "%s/%s" % (provider_id, model_id)
+            models[ref] = Model(
+                ref=ref,
+                provider=provider_id,
+                id=model_id,
+                name=m.get("name") or model_id,
+                cost_in=float(cost["input"]),
+                cost_out=float(cost["output"]),
+                context=int((m.get("limit") or {}).get("context") or 0),
+                tool_call=bool(m.get("tool_call")),
+                reasoning=bool(m.get("reasoning")),
+                released=str(m.get("release_date") or ""),
+            )
+    return models
+
+
+def normalize_name(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+
+
+_INDEX_FIELD_RE = re.compile(r"(intelligence|coding|agentic|math)", re.I)
+
+
+def _collect_indices(obj, out: Dict[str, Dict[str, float]], name_hint: Optional[str] = None) -> None:
+    """Tolerantly walk an unknown JSON shape collecting numeric index fields per model name."""
+    if isinstance(obj, dict):
+        name = obj.get("name") or obj.get("model_name") or name_hint
+        nums = {}
+        for k, v in obj.items():
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and _INDEX_FIELD_RE.search(k):
+                nums[k.lower()] = float(v)
+        if nums and name:
+            out.setdefault(normalize_name(str(name)), {}).update(nums)
+        for v in obj.values():
+            _collect_indices(v, out, name_hint=str(name) if name else name_hint)
+    elif isinstance(obj, list):
+        for v in obj:
+            _collect_indices(v, out, name_hint=name_hint)
+
+
+def load_aa_indices(cache_dir: str, api_key: Optional[str] = None, force: bool = False) -> Dict[str, Dict[str, float]]:
+    """Artificial Analysis index scores keyed by normalized model name.
+
+    Requires AA_API_KEY (free tier). Without a key, returns whatever was cached before
+    (possibly empty) - cost-only ranking still works.
+    """
+    indices_path = os.path.join(cache_dir, AA_INDICES_CACHE)
+    cached = read_json(indices_path)
+    if cached is not None and not force:
+        return cached
+    key = api_key or os.environ.get("AA_API_KEY")
+    if not key:
+        return cached or {}
+    try:
+        from ._net import fetch_json
+
+        raw = fetch_json_with_key(AA_URL, key)
+    except Exception:
+        return cached or {}
+    write_json(os.path.join(cache_dir, AA_CACHE), raw)
+    out: Dict[str, Dict[str, float]] = {}
+    _collect_indices(raw, out)
+    write_json(indices_path, out)
+    return out
+
+
+def fetch_json_with_key(url: str, key: str, timeout: int = 30):
+    import json
+    import urllib.request
+
+    from ._net import USER_AGENT
+
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "x-api-key": key})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def tier_of_ref(ref: str, config: dict, models: Dict[str, Model]) -> Optional[str]:
+    """Tier for a model ref: explicit tier membership first, then cost bands."""
+    tiers = config["tiers"]
+    for tier, spec in tiers.items():
+        if ref in spec["models"]:
+            return tier
+    m = models.get(ref)
+    if not m:
+        return None
+    bands = config.get("cost_bands") or {}
+    if m.cost_out <= float(bands.get("utility", 1.5)):
+        return "utility"
+    if m.cost_out <= float(bands.get("balanced", 15.0)):
+        return "balanced"
+    return "frontier"
+
+
+def rank_candidates(
+    refs: List[str],
+    models: Dict[str, Model],
+    quality: Optional[Dict[str, float]] = None,
+) -> List[Tuple[str, float, Optional[float]]]:
+    """Rank candidate refs by quality/cost value. Returns [(ref, blended_cost, quality)].
+
+    quality: optional ref -> 0..1 score (e.g. DeepSWE pass rate, AA normalized index).
+    Without quality, sorts by cost ascending.
+    """
+    quality = quality or {}
+    rows = []
+    for ref in refs:
+        m = models.get(ref)
+        if not m:
+            continue
+        q = quality.get(ref)
+        rows.append((ref, m.blended_cost, q))
+    if any(q is not None for _, _, q in rows):
+        rows.sort(key=lambda r: (-(r[2] or 0.0) / max(r[1], 1e-9), r[1]))
+    else:
+        rows.sort(key=lambda r: r[1])
+    return rows

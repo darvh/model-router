@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "model-router"
+version = "0.1.0"
+description = "Sticky-with-escalation model routing decision engine, calibrated on DeepSWE. Classifier + advisor chain; never executes, only decides."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = []
+
+[project.scripts]
+model-router = "model_router.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["model_router*"]
