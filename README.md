@@ -82,6 +82,8 @@ Route a run:
 python3 -m model_router route --run-id r1 --task "Fix the pagination helper." \
   --instruction "Keep the diff minimal."
 python3 -m model_router route --run-id r1 --signal prior_failure     # escalates one tier
+python3 -m model_router route --run-id r1 --message "still not working!!"  # frustration -> escalate + advisor
+python3 -m model_router route --run-id r1 --signal tool_error_rate=0.5     # tool errors -> escalate
 python3 -m model_router route --run-id r1 --signal needs_advisor    # advisor_required=true
 python3 -m model_router route --run-id r1 --signal complete         # sticky run ends
 ```
@@ -124,6 +126,12 @@ Signals: `prior_failure`, `verification_divergence`
 `needs_exploration` (floor at frontier), `needs_advisor`, `complete`. Any escalation also
 sets `advisor_required` with `advisor_reason: "escalation"` - failure/divergence also
 routes to advisor review.
+
+Numeric signals are optional and config-driven (`decision.signal_rules`, defaults):
+`user_frustration` >= 0.5 escalates + flags advisor, `tool_error_rate` >= 0.3 escalates.
+The CLI can score frustration from recent user messages: `--message "still not working!!"`.
+At most one tier per decision - extra triggers flag advisor. Rules fire only when the
+signal is passed; set `"enabled": false` or drop the rule to disable.
 
 ## Where the defaults come from
 
@@ -191,7 +199,9 @@ Findings, honestly:
   "advisor":    { "<tier>": "auto" | "<provider/model>" },
   "cost_bands": { "utility": 1.5, "balanced": 15.0 },   // $/M output -> tier fallback
   "decision":   { "mode": "cost" | "balanced" | "quality",
-                  "tier_requirement": { "utility": 0.35, "balanced": 0.6, "frontier": 0.8 } },
+                  "tier_requirement": { "utility": 0.35, "balanced": 0.6, "frontier": 0.8 },
+                  "signal_rules": { "user_frustration": { "threshold": 0.5, "action": "escalate_advise" },
+                                    "tool_error_rate": { "threshold": 0.3, "action": "escalate" } } },
   "classifier": { "frontier_prob": 0.45, "utility_prob": 0.55 },
   "instructions": { "base": "...", "escalation": "...", "advisor": "..." }
 }

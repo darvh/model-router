@@ -68,6 +68,31 @@ def heuristic_probs(text: str) -> Dict[str, float]:
     return {"utility": 0.20, "balanced": 0.60, "frontier": 0.20}
 
 
+FRUSTRATION_RE = re.compile(
+    r"(still (not|broken|failing|wrong)|not working|doesn'?t work|didn'?t work|"
+    r"\bagain\b|why (did|is|does|are)|i said|no[,!]? (that|this)|\bwrong\b|"
+    r"\bundo\b|\brevert\b|\bstop\b|\bbroken\b|failed again|fix it|seriously)",
+    re.I,
+)
+
+
+def frustration_score(messages: Sequence[str]) -> float:
+    """Heuristic 0..1 user-frustration score from the most recent messages.
+
+    Optional input: the caller can pass recent user messages and forward the score as
+    the `user_frustration` signal. Not a sentiment model - just cheap, testable cues.
+    """
+    recent = [m for m in (messages or []) if m][-3:]
+    if not recent:
+        return 0.0
+    score = 0.0
+    for text in recent:
+        hits = len(FRUSTRATION_RE.findall(text))
+        shout = 1.0 if text.count("!") >= 2 or text.count("?") >= 3 else 0.0
+        score += min(1.0, 0.4 * hits + 0.3 * shout)
+    return min(1.0, score / 2.0)
+
+
 class Vectorizer:
     def __init__(self, max_features: int = 1200, min_df: int = 2, max_df: float = 0.8):
         self.max_features = max_features

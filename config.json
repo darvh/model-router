@@ -42,6 +42,16 @@
       "utility": 0.35,
       "balanced": 0.6,
       "frontier": 0.8
+    },
+    "signal_rules": {
+      "user_frustration": {
+        "threshold": 0.5,
+        "action": "escalate_advise"
+      },
+      "tool_error_rate": {
+        "threshold": 0.3,
+        "action": "escalate"
+      }
     }
   },
   "classifier": {

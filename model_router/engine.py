@@ -36,6 +36,13 @@ ADVISOR_SIGNAL = "needs_advisor"
 # classifier's tier probabilities into a required-quality number for the task.
 DEFAULT_TIER_REQUIREMENT = {"utility": 0.35, "balanced": 0.6, "frontier": 0.8}
 
+# Optional numeric signal rules. Fires only when the caller passes the signal;
+# config decision.signal_rules replaces this map entirely.
+DEFAULT_SIGNAL_RULES = {
+    "user_frustration": {"threshold": 0.5, "action": "escalate_advise"},
+    "tool_error_rate": {"threshold": 0.3, "action": "escalate"},
+}
+
 
 @dataclass
 class Decision:
@@ -69,6 +76,7 @@ class RunState:
     advisor_required: bool = False
     advisor_reason: str = ""
     required_quality: float = 0.0
+    signals_applied: List[str] = field(default_factory=list)
     runtime_instructions: List[str] = field(default_factory=list)
     classifier_source: str = "none"
     classifier_probs: Dict[str, float] = field(default_factory=dict)
@@ -223,6 +231,7 @@ class Router:
                 "probs": state.classifier_probs,
                 "mode": (self.config.get("decision") or {}).get("mode", "cost"),
                 "required_quality": state.required_quality,
+                "signals_applied": list(state.signals_applied),
             },
         )
 
@@ -267,10 +276,14 @@ class Router:
 
         required r = sum(tier prob * tier anchor); feasible set = Q >= r.
         cost -> cheapest feasible; quality -> max Q; balanced -> max mean(Q, 1-C_norm).
+        Quality-based modes ignore unmeasured models when any measured candidate exists.
         """
         mode = (self.config.get("decision") or {}).get("mode", "cost")
         required = self._required_quality(probs)
         refs = [ref for _t, ref in self.ladder]
+        known = [ref for ref in refs if self.quality.get(ref) is not None]
+        if mode in ("quality", "balanced") and known:
+            refs = known
         feasible = [ref for ref in refs if self.quality.get(ref) is None or float(self.quality[ref]) >= required]
         pool = feasible or refs
         best = max(pool, key=lambda ref: (self._score(ref, mode), -(self._costs.get(ref) or 0.0)))
@@ -282,6 +295,44 @@ class Router:
                 return i
         raise ValueError("model not in ladder: %r" % ref)
 
+    def _signal_rules(self) -> Dict[str, dict]:
+        """Optional numeric signal rules; decision.signal_rules replaces the defaults."""
+        rules = (self.config.get("decision") or {}).get("signal_rules")
+        if rules is None:
+            return DEFAULT_SIGNAL_RULES
+        return rules or {}
+
+    def _apply_signal_rules(self, state: RunState, signals: Dict, applied: List[str]) -> None:
+        """Numeric/boolean signals -> escalate (at most one tier per decision) or advise.
+
+        Examples: user_frustration >= 0.5 -> escalate + advisor; tool_error_rate >= 0.3
+        -> escalate. All optional: nothing fires unless the caller passes the signal.
+        """
+        escalated = any(signals.get(s) for s in ESCALATING_SIGNALS)
+        for name, rule in self._signal_rules().items():
+            if not rule or rule.get("enabled") is False or name not in signals:
+                continue
+            raw = signals[name]
+            value = 1.0 if raw is True else (0.0 if raw is False else float(raw))
+            if value < float(rule.get("threshold", 0.5)):
+                continue
+            action = str(rule.get("action", "escalate"))
+            applied.append(name)
+            if "escalate" in action:
+                if escalated:
+                    state.advisor_required = True
+                    state.advisor_reason = state.advisor_reason or name
+                else:
+                    escalated = self._move(state, self._escalation_target(state), "rule:" + name)
+                    if escalated:
+                        state.advisor_reason = name
+                    else:
+                        state.advisor_required = True
+                        state.advisor_reason = state.advisor_reason or name
+            if "advise" in action:
+                state.advisor_required = True
+                state.advisor_reason = state.advisor_reason or name
+
     # ------------------------------------------------------------------- public
 
     def decide(
@@ -291,7 +342,7 @@ class Router:
         signals: Optional[Dict[str, bool]] = None,
         instruction: Optional[str] = None,
     ) -> Decision:
-        signals = {k: bool(v) for k, v in (signals or {}).items() if v}
+        signals = {k: v for k, v in (signals or {}).items() if v not in (None, False)}
 
         state = self.store.get(run_id)
         if state is not None and state.closed:
@@ -347,6 +398,11 @@ class Router:
 
         if any(signals.get(s) for s in ESCALATING_SIGNALS):
             self._move(state, self._escalation_target(state), "signal")
+
+        applied: List[str] = []
+        self._apply_signal_rules(state, signals, applied)
+        if applied:
+            state.signals_applied.extend(applied)
 
         if signals.get(ADVISOR_SIGNAL):
             state.advisor_required = True

@@ -8,7 +8,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from model_router.catalog import AA_INDICES_CACHE, Model, load_aa_indices, quality_from_indices, rank_candidates, tier_of_ref
-from model_router.classify import Classifier
+from model_router.classify import Classifier, frustration_score
 from model_router.deepswe import labels
 from model_router.engine import Router, RunStore
 
@@ -144,6 +144,45 @@ class EngineTests(unittest.TestCase):
         r = Router(cfg, make_models(), classifier=StubClassifier("balanced", probs), quality=quality)
         self.assertEqual(r.decide("rm3", "x").model, "p/b1")  # max arithmetic mean of Q and cost score
 
+    def test_numeric_signals_escalate_and_advise(self):
+        self.router.decide("rs1", "x")  # u1
+        d = self.router.decide("rs1", signals={"user_frustration": 0.8})
+        self.assertEqual(d.tier, "balanced")
+        self.assertTrue(d.advisor_required)
+        self.assertEqual(d.advisor_reason, "user_frustration")
+        self.assertIn("user_frustration", d.rationale["signals_applied"])
+
+    def test_numeric_signals_below_threshold_noop(self):
+        self.router.decide("rs2", "x")
+        d = self.router.decide("rs2", signals={"tool_error_rate": 0.1})
+        self.assertEqual(d.tier, "utility")
+        self.assertEqual(d.escalation_count, 0)
+        self.assertEqual(d.rationale["signals_applied"], [])
+
+    def test_signal_stacking_caps_escalation(self):
+        self.router.decide("rs3", "x")
+        d = self.router.decide(
+            "rs3",
+            signals={"prior_failure": True, "tool_error_rate": 0.9, "user_frustration": 0.9},
+        )
+        self.assertEqual(d.escalation_count, 1)  # at most one tier per decision
+        self.assertTrue(d.advisor_required)
+
+    def test_signal_rules_can_be_disabled(self):
+        cfg = _json.loads(_json.dumps(CONFIG))
+        cfg["decision"] = {"mode": "cost", "signal_rules": {"user_frustration": {"enabled": False}}}
+        r = Router(cfg, make_models(), classifier=StubClassifier("balanced"))
+        r.decide("rs4", "x")
+        d = r.decide("rs4", signals={"user_frustration": 0.9})
+        self.assertEqual(d.escalation_count, 0)
+
+    def test_quality_modes_ignore_unmeasured_models(self):
+        base = _json.loads(_json.dumps(CONFIG))
+        base["decision"] = {"mode": "quality"}
+        quality = {"p/b1": 0.3}  # only b1 measured; unknown models would score 0.5 and win
+        r = Router(base, make_models(), classifier=StubClassifier("balanced"), quality=quality)
+        self.assertEqual(r.decide("rq1", "x").model, "p/b1")
+
     def test_escalation_caps_at_top(self):
         r = Router(CONFIG, make_models(), classifier=StubClassifier("balanced"))
         r.decide("rt", "x")  # u1
@@ -183,6 +222,11 @@ class ClassifierTests(unittest.TestCase):
         tier, _probs, source = Classifier().predict("fix a typo")
         self.assertEqual(source, "heuristic")
         self.assertIn(tier, ("utility", "balanced", "frontier"))
+
+    def test_frustration_score(self):
+        self.assertGreaterEqual(frustration_score(["still not working!!", "fix it again"]), 0.5)
+        self.assertEqual(frustration_score(["add a unit test"]), 0.0)
+        self.assertEqual(frustration_score([]), 0.0)
 
     def test_save_load_roundtrip(self):
         with tempfile.TemporaryDirectory() as td:

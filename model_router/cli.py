@@ -28,7 +28,7 @@ from .catalog import (
     resolve_ref,
     tier_of_ref,
 )
-from .classify import Classifier, kfold_accuracy
+from .classify import Classifier, frustration_score, kfold_accuracy
 from .deepswe import (
     DEFAULT_VERSION,
     fetch_instructions,
@@ -38,7 +38,7 @@ from .deepswe import (
     model_stats,
     task_model_stats,
 )
-from .engine import RunStore, Router, TIERS
+from .engine import ADVISOR_SIGNAL, DEFAULT_SIGNAL_RULES, ESCALATING_SIGNALS, FLOOR_SIGNALS, RunStore, Router, TIERS
 
 DEFAULT_CACHE = os.environ.get("MODEL_ROUTER_CACHE") or os.path.join(
     os.path.expanduser("~"), ".cache", "model-router"
@@ -316,7 +316,20 @@ def cmd_route(args) -> None:
     if not task and not sys.stdin.isatty():
         task = sys.stdin.read()
 
-    signals = {s: True for s in (args.signal or [])}
+    signals = {}
+    known = set(FLOOR_SIGNALS) | set(ESCALATING_SIGNALS) | {ADVISOR_SIGNAL, "complete"}
+    known |= set((cfg.get("decision") or {}).get("signal_rules") or DEFAULT_SIGNAL_RULES)
+    for item in args.signal or []:
+        name, _sep, raw = item.partition("=")
+        if name not in known:
+            sys.exit("unknown signal: %s (known: %s)" % (name, ", ".join(sorted(known))))
+        signals[name] = float(raw) if raw else True
+    if args.message:
+        score = frustration_score(args.message)
+        if score > 0:
+            previous = signals.get("user_frustration", 0.0)
+            previous = 1.0 if previous is True else float(previous)
+            signals["user_frustration"] = max(previous, score)
     instructions = args.instruction or []
     decision = router.decide(
         args.run_id, task, signals=signals, instruction=instructions[0] if instructions else None
@@ -400,7 +413,8 @@ def main(argv=None) -> None:
     base(p)
     p.add_argument("--run-id", default="default")
     p.add_argument("--task", default=None, help="task text (else read stdin)")
-    p.add_argument("--signal", action="append", default=[], choices=["prior_failure", "verification_divergence", "not_understood", "planning_needs_more_tools", "needs_exploration", "needs_advisor", "complete"], help="repeatable: escalate, floor, advisor, or close")
+    p.add_argument("--signal", action="append", default=[], help="name or name=0..1 (repeatable): prior_failure, verification_divergence, not_understood, planning_needs_more_tools, needs_exploration, needs_advisor, user_frustration, tool_error_rate, complete")
+    p.add_argument("--message", action="append", default=[], help="recent user message (repeatable); auto-scores user_frustration")
     p.add_argument("--instruction", action="append", default=[], help="append to the run instruction stack")
     p.set_defaults(func=cmd_route)
 
