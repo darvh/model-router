@@ -97,7 +97,9 @@ python3 -m model_router route --run-id r1 --signal tool_error_rate=0.5     # too
 python3 -m model_router route --run-id r1 --signal needs_advisor    # advisor_required=true
 python3 -m model_router route --run-id r1 --signal complete         # sticky run ends
 python3 -m model_router route --run-id r1 --budget 2.0              # USD cap; escalation stops at the money line
+python3 -m model_router route --run-id r1 --tier balanced           # harness-supplied classification; skips the built-in one
 python3 -m model_router outcome --run-id r1 --success --cost 0.12   # feed the outcome back; priors adapt
+python3 -m model_router ab-report                                    # live A/B: success + cost per arm, with a p-value
 cat ~/.cache/model-router/decisions.jsonl | tail -1                # append-only decision audit log
 ```
 
@@ -121,6 +123,7 @@ Decision shape (trimmed):
   "escalated": true,
   "escalation_count": 1,
   "instructions": ["...base...", "...tier directive...", "Escalation: utility -> balanced. ..."],
+  "arm": "router",
   "rationale": {
     "classifier": "trained",
     "probs": { "utility": 0.99 },
@@ -227,6 +230,19 @@ Findings, honestly:
   (effort + model-specific params), advisor fork, escalation timing, instruction stack,
   spend cap. It does not control prompts beyond the stack, tool policy, or execution -
   that is the caller's side.
+- **Bring your own classifier.** The built-in one is a calibrated bag-of-words model and
+  it is weak (65.5% CV against an 85% majority baseline); it is a fallback, not the
+  product. Two supported replacements: pass `tier=` / `--tier` when your harness has
+  already classified the task (e.g. an LLM judging the request against per-tier criteria,
+  the approach that produced a real tier spread in LangChain's live A/B), or inject any
+  object with `predict(text) -> (tier, probs, source)` into `Router`. Everything
+  downstream - quality gate, budget, ladder, advisor, effort, instruction stack - is
+  unchanged.
+- **Live A/B** (config `ab`): set `enabled` and a run is assigned to `router` or a fixed
+  `baseline_tier` control by a stable hash of its `run_id`; the baseline arm never
+  escalates. Record outcomes with `outcome`, then `ab-report` prints runs, trials,
+  success rate, cost/run per arm, and a two-proportion p-value. This is the experiment
+  that turns the replay numbers into live evidence.
 - **Every decision is logged** to `~/.cache/model-router/decisions.jsonl` (one JSON line:
   run, turn, tier, model, effort, advisor, cost source, rationale, signals), so a caller
   can audit what it was told and why. Run state is single-writer per `run_id`: writes are
@@ -253,6 +269,7 @@ Findings, honestly:
                   "budget_usd": null,  // optional $/task-run cap; escalation blocked past it (advisor reason "budget")
                   "signal_rules": { "user_frustration": { "threshold": 0.5, "action": "escalate_advise" },
                                     "tool_error_rate": { "threshold": 0.3, "action": "escalate" } } },
+  "ab":         { "enabled": false, "split": 0.5, "baseline_tier": "frontier" },  // optional live A/B; split = router share
   "efforts":    { "utility": "low", "balanced": "medium", "frontier": "medium" },  // per tier or "<provider/model>"
   "effort_budgets": { "low": 1024, "medium": 8192, "high": 32768 },  // optional; for budget_tokens models
   "outcomes":   { "prior_weight": 5.0 },  // optional; pseudo-counts for offline priors vs observed outcomes

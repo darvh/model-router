@@ -418,6 +418,59 @@ class EngineTests(unittest.TestCase):
         self.assertNotIn("notes", perf)
         self.assertEqual(performance_from_entry(None), {})
 
+    def test_external_tier_override(self):
+        """A harness classifier can supply the tier; the rest of the pipeline still holds."""
+        r = Router(CONFIG, make_models(), classifier=StubClassifier("utility"), costs=MEASURED)
+        d = r.decide("ro1", "x", tier="balanced")
+        self.assertEqual(d.tier, "balanced")
+        self.assertEqual(d.rationale["classifier"], "external")
+        self.assertEqual(d.rationale["probs"]["balanced"], 1.0)
+        with self.assertRaises(ValueError):
+            r.decide("ro2", "x", tier="nonsense")
+
+    def test_ab_arm_assignment_is_deterministic(self):
+        cfg = _json.loads(_json.dumps(CONFIG))
+        cfg["ab"] = {"enabled": True, "split": 0.5, "baseline_tier": "frontier"}
+        r = Router(cfg, make_models(), classifier=StubClassifier("utility"), costs=MEASURED)
+        arms = {r._assign_arm("run-%d" % i) for i in range(200)}
+        self.assertEqual(arms, {"router", "baseline"})  # both arms get traffic
+        self.assertEqual(r._assign_arm("run-7"), r._assign_arm("run-7"))  # stable per run
+
+    def test_ab_baseline_is_fixed_control(self):
+        cfg = _json.loads(_json.dumps(CONFIG))
+        cfg["ab"] = {"enabled": True, "split": 0.0, "baseline_tier": "frontier"}  # everyone baseline
+        r = Router(cfg, make_models(), classifier=StubClassifier("utility"), costs=MEASURED)
+        d = r.decide("rab1", "x", signals={"prior_failure": True, "user_frustration": 0.9})
+        self.assertEqual(d.arm, "baseline")
+        self.assertEqual(d.tier, "frontier")
+        self.assertEqual(d.model, "p/f1")
+        self.assertEqual(d.escalation_count, 0)  # no escalation in the control
+        d2 = r.decide("rab1", "x", signals={"prior_failure": True})
+        self.assertEqual(d2.model, "p/f1")  # sticky
+
+    def test_ab_router_arm_escalates_normally(self):
+        cfg = _json.loads(_json.dumps(CONFIG))
+        cfg["ab"] = {"enabled": True, "split": 1.0, "baseline_tier": "frontier"}  # everyone router
+        r = Router(cfg, make_models(), classifier=StubClassifier("utility"), costs=MEASURED)
+        d = r.decide("rab2", "x", signals={"prior_failure": True})
+        self.assertEqual(d.arm, "router")
+        self.assertEqual(d.escalation_count, 1)
+
+    def test_record_outcome_counts_successes_failures(self):
+        r = Router(CONFIG, make_models(), classifier=StubClassifier("balanced"))
+        r.decide("rc5", "x")
+        r.record_outcome("rc5", True, cost_usd=0.2)
+        r.record_outcome("rc5", False)
+        state = r.store.get("rc5")
+        self.assertEqual((state.successes, state.failures), (1, 1))
+
+    def test_two_proportion_p(self):
+        from model_router.cli import _two_proportion_p
+
+        self.assertLess(_two_proportion_p(90, 100, 50, 100), 0.001)
+        self.assertGreater(_two_proportion_p(50, 100, 52, 100), 0.5)
+        self.assertEqual(_two_proportion_p(0, 0, 5, 10), 1.0)
+
     def test_escalation_caps_at_top(self):
         r = Router(CONFIG, make_models(), classifier=StubClassifier("balanced"))
         r.decide("rt", "x")  # u1

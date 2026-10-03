@@ -538,11 +538,76 @@ def cmd_route(args) -> None:
     signals = _parse_signals(args.signal, args.message, cfg)
     instructions = args.instruction or []
     decision = router.decide(
-        args.run_id, task, signals=signals, instruction=instructions[0] if instructions else None, budget_usd=args.budget
+        args.run_id,
+        task,
+        signals=signals,
+        instruction=instructions[0] if instructions else None,
+        budget_usd=args.budget,
+        tier=args.tier,
     )
     for extra in instructions[1:]:
         decision = router.add_instruction(args.run_id, extra) or decision
     print(json.dumps(decision.to_dict(), indent=2))
+
+
+def _two_proportion_p(s1: int, n1: int, s2: int, n2: int) -> float:
+    """Two-sided p-value for a difference in success rates (normal approximation)."""
+    import math
+
+    if n1 == 0 or n2 == 0:
+        return 1.0
+    p1, p2 = s1 / n1, s2 / n2
+    p = (s1 + s2) / (n1 + n2)
+    se = math.sqrt(p * (1.0 - p) * (1.0 / n1 + 1.0 / n2))
+    if se <= 0:
+        return 1.0
+    z = (p1 - p2) / se
+    return math.erfc(abs(z) / math.sqrt(2.0))
+
+
+def cmd_ab_report(args) -> None:
+    """Summarize a live A/B from recorded run outcomes (see config `ab`)."""
+    runs_dir = os.path.join(args.cache_dir, "runs")
+    arms: Dict[str, dict] = {}
+    if os.path.isdir(runs_dir):
+        for name in sorted(os.listdir(runs_dir)):
+            if not name.endswith(".json"):
+                continue
+            d = read_json(os.path.join(runs_dir, name))
+            if not isinstance(d, dict):
+                continue
+            arm = str(d.get("arm") or "router")
+            n = int(d.get("successes") or 0) + int(d.get("failures") or 0)
+            if n == 0:
+                continue
+            a = arms.setdefault(arm, {"runs": 0, "successes": 0, "trials": 0, "cost_sum": 0.0, "cost_n": 0})
+            a["runs"] += 1
+            a["successes"] += int(d.get("successes") or 0)
+            a["trials"] += n
+            c = d.get("spent_usd")
+            if isinstance(c, (int, float)) and c > 0:
+                a["cost_sum"] += float(c)
+                a["cost_n"] += 1
+    if not arms:
+        print("no recorded outcomes yet: route runs, then `outcome --run-id ... --success [--cost]`")
+        return
+
+    print("live A/B (runs with recorded outcomes)")
+    print("  %-10s %6s %8s %10s %12s" % ("arm", "runs", "trials", "success", "cost/run"))
+    for arm, a in sorted(arms.items()):
+        rate = (a["successes"] / a["trials"]) if a["trials"] else 0.0
+        cost = (a["cost_sum"] / a["cost_n"]) if a["cost_n"] else float("nan")
+        print("  %-10s %6d %8d %9.1f%% %12s" % (arm, a["runs"], a["trials"], 100 * rate, "%.3f" % cost if a["cost_n"] else "-"))
+
+    if "router" in arms and "baseline" in arms:
+        r, b = arms["router"], arms["baseline"]
+        p = _two_proportion_p(r["successes"], r["trials"], b["successes"], b["trials"])
+        dr = (r["successes"] / r["trials"] - b["successes"] / b["trials"]) if r["trials"] and b["trials"] else 0.0
+        print("success difference (router - baseline): %+.1f points, p = %.3f" % (100 * dr, p))
+        if p >= 0.05:
+            print("not significant yet; keep collecting outcomes before acting on it")
+    else:
+        print("only one arm recorded so far; the other arm fills in as its runs finish")
 
 
 def cmd_rank(args) -> None:
@@ -630,6 +695,7 @@ def main(argv=None) -> None:
     p.add_argument("--message", action="append", default=[], help="recent user message (repeatable); auto-scores user_frustration")
     p.add_argument("--instruction", action="append", default=[], help="append to the run instruction stack")
     p.add_argument("--budget", type=float, default=None, help="USD cap; escalation is blocked past it (advisor flagged)")
+    p.add_argument("--tier", choices=list(TIERS), default=None, help="harness-supplied classification; skips the built-in classifier")
     p.set_defaults(func=cmd_route)
 
     p = sub.add_parser("outcome", help="record a run outcome for adaptive priors")
@@ -640,6 +706,10 @@ def main(argv=None) -> None:
     group.add_argument("--failure", action="store_true")
     p.add_argument("--cost", type=float, default=None, help="observed cost in USD")
     p.set_defaults(func=cmd_outcome)
+
+    p = sub.add_parser("ab-report", help="summarize a live A/B from recorded run outcomes")
+    base(p)
+    p.set_defaults(func=cmd_ab_report)
 
     p = sub.add_parser("rank", help="rank candidate models by cost + real quality signal")
     base(p)

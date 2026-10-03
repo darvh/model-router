@@ -49,6 +49,11 @@
       }
     }
   },
+  "ab": {
+    "enabled": false,
+    "split": 0.5,
+    "baseline_tier": "frontier"
+  },
   "efforts": {
     "utility": "low",
     "balanced": "medium",

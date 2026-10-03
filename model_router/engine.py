@@ -14,6 +14,7 @@ Semantics:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -90,6 +91,7 @@ class Decision:
     instructions: List[str]
     signals: Dict[str, bool]
     rationale: Dict
+    arm: str = "router"  # router | baseline, when an A/B is configured
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -106,6 +108,9 @@ class RunState:
     advisor_reason: str = ""
     required_quality: float = 0.0
     domain: str = "general"
+    arm: str = "router"  # router | baseline
+    successes: int = 0
+    failures: int = 0
     spent_usd: float = 0.0
     budget_usd: Optional[float] = None
     signals_applied: List[str] = field(default_factory=list)
@@ -182,6 +187,7 @@ class Router:
         self.anchors = dict(anchors or {})  # calibrated tier -> required quality
         self.costs = dict(costs or {})  # measured $/task where available
         self.costs.update(config.get("costs") or {})  # config per-task overrides, if any
+        self.ab = dict(config.get("ab") or {})  # optional live A/B: {"enabled", "split", "baseline_tier"}
         # Observed outcomes, keyed "ref|domain": {"n", "successes", "cost_sum", "cost_n"}.
         # Mutated in place by record_outcome so callers can persist the same dict.
         self.outcomes = outcomes if outcomes is not None else {}
@@ -318,6 +324,19 @@ class Router:
         state.advisor_reason = "budget_unpriced" if unpriced else (reason or "escalation")
         return True
 
+    def _assign_arm(self, run_id: str) -> str:
+        """Deterministic A/B arm. `split` is the share of runs the router handles; the rest
+        get the baseline. Stable hash of run_id, so a retried run keeps its arm."""
+        if not self.ab.get("enabled"):
+            return "router"
+        split = float(self.ab.get("split", 0.5))
+        bucket = int(hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:8], 16) % 100
+        return "router" if bucket < split * 100 else "baseline"
+
+    def _baseline_index(self) -> int:
+        tier = str(self.ab.get("baseline_tier", "frontier"))
+        return self._tier_start_or_none(tier) if self._tier_start_or_none(tier) is not None else len(self.ladder) - 1
+
     def _snapshot(self, state: RunState, signals: Dict[str, bool]) -> Decision:
         tier, model = self.ladder[state.ladder_index]
         instructions = self.config.get("instructions") or {}
@@ -346,6 +365,7 @@ class Router:
             closed=state.closed,
             instructions=stack,
             signals=dict(signals),
+            arm=state.arm,
             rationale={
                 "classifier": state.classifier_source,
                 "probs": state.classifier_probs,
@@ -586,7 +606,11 @@ class Router:
         signals: Optional[Dict[str, bool]] = None,
         instruction: Optional[str] = None,
         budget_usd: Optional[float] = None,
+        tier: Optional[str] = None,
     ) -> Decision:
+        """Decide for a run. `tier` lets a harness supply its own classification (e.g. an
+        LLM judging the task against tier criteria) and keeps every downstream guarantee:
+        quality gate, budget, ladder, advisor, effort, instructions."""
         signals = {k: v for k, v in (signals or {}).items() if v not in (None, False)}
 
         state = self.store.get(run_id)
@@ -624,12 +648,27 @@ class Router:
             return self._snapshot(state, signals)
 
         if state is None:
+            arm = self._assign_arm(run_id)
             probs: Dict[str, float] = {}
             source = "none"
-            if self.classifier is not None and task:
-                _tier, probs, source = self.classifier.predict(task)
             domain = task_domain(task) if task else "general"
-            model, required = self._select_initial(probs, domain)
+            if arm == "baseline":
+                # Control arm: fixed at the baseline model, no classification, no escalation.
+                model = self.ladder[self._baseline_index()][1]
+                required = 0.0
+            elif tier is not None:
+                if tier not in TIERS:
+                    raise ValueError("tier must be one of %s, got %r" % (", ".join(TIERS), tier))
+                probs = {t: 1.0 if t == tier else 0.0 for t in TIERS}
+                source = "external"
+                # An explicit tier is a start instruction, not a capability hint: begin at
+                # that tier's first model. Escalation, budget, and gates still apply after.
+                model = self.ladder[self._tier_start(tier)][1]
+                required = self._required_quality(probs)
+            else:
+                if self.classifier is not None and task:
+                    _tier, probs, source = self.classifier.predict(task)
+                model, required = self._select_initial(probs, domain)
             state = RunState(
                 run_id=run_id,
                 ladder_index=self._ladder_index(model),
@@ -637,6 +676,7 @@ class Router:
                 classifier_probs=probs,
                 required_quality=required,
                 domain=domain,
+                arm=arm,
             )
 
         if budget_usd is None:
@@ -645,7 +685,11 @@ class Router:
             state.budget_usd = float(budget_usd)
         # A budget smaller than the chosen model: take the cheapest affordable feasible
         # candidate instead. If nothing fits, keep the pick and say so (advisor decides).
-        if state.budget_usd is not None and not self._can_afford(state, state.ladder_index):
+        if (
+            state.arm != "baseline"
+            and state.budget_usd is not None
+            and not self._can_afford(state, state.ladder_index)
+        ):
             cheaper = self._affordable_feasible(state, state.required_quality)
             if cheaper is not None:
                 state.ladder_index = self._ladder_index(cheaper)
@@ -656,25 +700,27 @@ class Router:
         if instruction:
             state.runtime_instructions.append(instruction)
 
+        # The baseline arm is a fixed control: no floors, no escalation, no rules.
         escalated_this_turn = False
-        current_tier = self.ladder[state.ladder_index][0]
-        for sig, floor in FLOOR_SIGNALS.items():
-            if signals.get(sig) and TIERS.index(floor) > TIERS.index(current_tier):
-                if self._move(state, self._tier_start(floor), "floor:" + sig):
-                    escalated_this_turn = True
-                    current_tier = self.ladder[state.ladder_index][0]
+        if state.arm != "baseline":
+            current_tier = self.ladder[state.ladder_index][0]
+            for sig, floor in FLOOR_SIGNALS.items():
+                if signals.get(sig) and TIERS.index(floor) > TIERS.index(current_tier):
+                    if self._move(state, self._tier_start(floor), "floor:" + sig):
+                        escalated_this_turn = True
+                        current_tier = self.ladder[state.ladder_index][0]
 
-        if any(signals.get(s) for s in ESCALATING_SIGNALS):
-            if escalated_this_turn:
-                state.advisor_required = True
-                state.advisor_reason = state.advisor_reason or "escalation"
-            else:
-                escalated_this_turn = self._move(state, self._escalation_target(state), "escalation")
+            if any(signals.get(s) for s in ESCALATING_SIGNALS):
+                if escalated_this_turn:
+                    state.advisor_required = True
+                    state.advisor_reason = state.advisor_reason or "escalation"
+                else:
+                    escalated_this_turn = self._move(state, self._escalation_target(state), "escalation")
 
-        applied: List[str] = []
-        self._apply_signal_rules(state, signals, applied, escalated_this_turn)
-        if applied:
-            state.signals_applied.extend(applied)
+            applied: List[str] = []
+            self._apply_signal_rules(state, signals, applied, escalated_this_turn)
+            if applied:
+                state.signals_applied.extend(applied)
 
         if signals.get(ADVISOR_SIGNAL):
             state.advisor_required = True
@@ -721,11 +767,14 @@ class Router:
         obs["n"] = int(obs.get("n", 0)) + 1
         if success:
             obs["successes"] = int(obs.get("successes", 0)) + 1
+            state.successes = int(state.successes or 0) + 1
+        else:
+            state.failures = int(state.failures or 0) + 1
         if cost_usd is not None:
             obs["cost_sum"] = float(obs.get("cost_sum", 0.0)) + float(cost_usd)
             obs["cost_n"] = int(obs.get("cost_n", 0)) + 1
             state.spent_usd = float(state.spent_usd or 0.0) + float(cost_usd)
-            self.store.put(state)
+        self.store.put(state)
         return {"ref": ref, "domain": state.domain, "n": obs["n"], "successes": obs["successes"]}
 
     def state(self, run_id: str) -> Optional[RunState]:
