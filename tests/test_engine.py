@@ -176,6 +176,34 @@ class EngineTests(unittest.TestCase):
         d = r.decide("rs4", signals={"user_frustration": 0.9})
         self.assertEqual(d.escalation_count, 0)
 
+    def test_tool_error_rate_escalates(self):
+        self.router.decide("rs5", "x")
+        d = self.router.decide("rs5", signals={"tool_error_rate": 0.5})
+        self.assertEqual(d.tier, "balanced")
+        self.assertEqual(d.escalation_count, 1)
+        self.assertEqual(d.advisor_reason, "tool_error_rate")
+
+    def test_floor_and_failure_capped_at_one_tier(self):
+        r = Router(CONFIG, make_models(), classifier=StubClassifier("utility"))
+        r.decide("rcap", "x")  # u1
+        d = r.decide("rcap", signals={"not_understood": True, "prior_failure": True})
+        self.assertEqual(d.tier, "balanced")  # floor applied; failure only flags advisor
+        self.assertEqual(d.escalation_count, 1)
+        self.assertTrue(d.advisor_required)
+
+    def test_run_store_corrupt_and_old_schema(self):
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, "bad.json"), "w", encoding="utf-8") as f:
+                f.write("{not json")
+            store = RunStore(td)
+            self.assertIsNone(store.get("bad"))
+            old = {"run_id": "old", "ladder_index": 1, "turn": 3, "advisor_required": True, "bogus": 1}
+            with open(os.path.join(td, "old.json"), "w", encoding="utf-8") as f:
+                _json.dump(old, f)
+            state = store.get("old")
+            self.assertEqual(state.turn, 3)
+            self.assertEqual(state.signals_applied, [])
+
     def test_quality_modes_ignore_unmeasured_models(self):
         base = _json.loads(_json.dumps(CONFIG))
         base["decision"] = {"mode": "quality"}
@@ -287,12 +315,54 @@ class RankingTests(unittest.TestCase):
         self.assertEqual(refs, ["p/u2", "p/u1"])  # 1.6 vs 1.0 value
 
     def test_quality_from_indices(self):
-        self.assertEqual(quality_from_indices({"artificial_analysis_coding_index": 81.0}), 0.81)
-        self.assertEqual(quality_from_indices({"intelligence": 0.9}), 0.9)
-        self.assertEqual(quality_from_indices({"coding": 120.0}), 1.0)
+        self.assertAlmostEqual(quality_from_indices({"artificial_analysis_coding_index": 81.0}), 0.81)
+        self.assertAlmostEqual(quality_from_indices({"intelligence": 0.9}), 0.009)
+        self.assertAlmostEqual(quality_from_indices({"coding": 120.0}), 1.0)
+        self.assertEqual(
+            quality_from_indices(
+                {"artificial_analysis_intelligence_index": 50.0, "artificial_analysis_coding_index": 80.0}
+            ),
+            0.8,
+        )
         self.assertIsNone(quality_from_indices(None))
         self.assertIsNone(quality_from_indices({"math": 70.0}))
         self.assertIsNone(quality_from_indices({"artificial_analysis_intelligence_index_cost": 12.0}))
+
+    def test_extract_aa_entries(self):
+        from model_router.catalog import _extract_aa_entries, canon
+
+        entries = [
+            {
+                "slug": "gpt-6-astra",
+                "name": "GPT-6 Astra",
+                "evaluations": {
+                    "artificial_analysis_coding_index": 76.9,
+                    "artificial_analysis_intelligence_index": 52.7,
+                    "artificial_analysis_intelligence_index_cost": 4.2,
+                    "notes": "x",
+                },
+            },
+            {"name": "No Slug Model", "evaluations": {"artificial_analysis_intelligence_index": 30.0}},
+            {"slug": "no-evals"},
+            "junk",
+        ]
+        out = _extract_aa_entries(entries)
+        self.assertIn(canon("gpt-6-astra"), out)
+        self.assertNotIn("artificial_analysis_intelligence_index_cost", out[canon("gpt-6-astra")])
+        self.assertIn(canon("No Slug Model"), out)
+        self.assertEqual(len(out), 2)
+
+    def test_build_quality_aa_overrides(self):
+        from model_router.catalog import AA_INDICES_CACHE, canon
+        from model_router.cli import build_quality
+
+        with tempfile.TemporaryDirectory() as td:
+            idx = {canon("gpt-x"): {"artificial_analysis_coding_index": 80.0}}
+            with open(os.path.join(td, AA_INDICES_CACHE), "w", encoding="utf-8") as f:
+                _json.dump(idx, f)
+            models = {"p/gpt-x": Model("p/gpt-x", "p", "gpt-x", "GPT-X", 1, 2, 128000, True, True, "2026-01-01")}
+            quality = build_quality(models, td)
+            self.assertAlmostEqual(quality["p/gpt-x"], 0.8)
 
 
 class AaCacheTests(unittest.TestCase):
@@ -302,6 +372,40 @@ class AaCacheTests(unittest.TestCase):
             with open(os.path.join(td, AA_INDICES_CACHE), "w", encoding="utf-8") as f:
                 _json.dump(data, f)
             self.assertEqual(load_aa_indices(td), data)
+
+
+class CliHelpersTests(unittest.TestCase):
+    def test_dotenv_parsing(self):
+        from model_router.cli import _load_dotenv
+
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, ".env")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write('# comment\nexport AA_API_KEY="secret-1"  # inline\nPLAIN=plain-value\n')
+            saved = {k: os.environ.pop(k, None) for k in ("AA_API_KEY", "PLAIN")}
+            try:
+                _load_dotenv(path)
+                self.assertEqual(os.environ["AA_API_KEY"], "secret-1")
+                self.assertEqual(os.environ["PLAIN"], "plain-value")
+                os.environ["PLAIN"] = "existing"
+                _load_dotenv(path)
+                self.assertEqual(os.environ["PLAIN"], "existing")  # never overrides
+            finally:
+                for k, v in saved.items():
+                    os.environ.pop(k, None)
+                    if v is not None:
+                        os.environ[k] = v
+
+    def test_parse_signals(self):
+        from model_router.cli import _parse_signals
+
+        signals = _parse_signals(["tool_error_rate=0.7"], ["still not working!!", "fix it again"], {})
+        self.assertEqual(signals["tool_error_rate"], 0.7)
+        self.assertGreaterEqual(signals["user_frustration"], 0.5)
+        with self.assertRaises(SystemExit):
+            _parse_signals(["nope"], [], {})
+        with self.assertRaises(SystemExit):
+            _parse_signals(["tool_error_rate=abc"], [], {})
 
 
 if __name__ == "__main__":

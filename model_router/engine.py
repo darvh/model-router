@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from typing import Dict, List, Optional, Tuple
 
 from ._net import read_json, write_json
@@ -99,10 +99,15 @@ class RunStore:
             return self._mem[run_id]
         if self.directory:
             d = read_json(self._path(run_id))
-            if d:
-                state = RunState(**d)
-                self._mem[run_id] = state
-                return state
+            if isinstance(d, dict):
+                names = {f.name for f in fields(RunState)}
+                try:
+                    state = RunState(**{k: v for k, v in d.items() if k in names})
+                except (TypeError, ValueError):
+                    state = None  # corrupt state: start the run fresh rather than crash
+                if state is not None:
+                    self._mem[run_id] = state
+                    return state
         return None
 
     def put(self, state: RunState) -> None:
@@ -201,7 +206,7 @@ class Router:
         state.escalated = True
         state.escalation_count += 1
         state.advisor_required = True  # failure/divergence also routes to advisor review
-        state.advisor_reason = "escalation"
+        state.advisor_reason = reason or "escalation"
         return True
 
     def _snapshot(self, state: RunState, signals: Dict[str, bool]) -> Decision:
@@ -302,13 +307,12 @@ class Router:
             return DEFAULT_SIGNAL_RULES
         return rules or {}
 
-    def _apply_signal_rules(self, state: RunState, signals: Dict, applied: List[str]) -> None:
+    def _apply_signal_rules(self, state: RunState, signals: Dict, applied: List[str], escalated: bool) -> None:
         """Numeric/boolean signals -> escalate (at most one tier per decision) or advise.
 
         Examples: user_frustration >= 0.5 -> escalate + advisor; tool_error_rate >= 0.3
         -> escalate. All optional: nothing fires unless the caller passes the signal.
         """
-        escalated = any(signals.get(s) for s in ESCALATING_SIGNALS)
         for name, rule in self._signal_rules().items():
             if not rule or rule.get("enabled") is False or name not in signals:
                 continue
@@ -323,10 +327,8 @@ class Router:
                     state.advisor_required = True
                     state.advisor_reason = state.advisor_reason or name
                 else:
-                    escalated = self._move(state, self._escalation_target(state), "rule:" + name)
-                    if escalated:
-                        state.advisor_reason = name
-                    else:
+                    escalated = self._move(state, self._escalation_target(state), name)
+                    if not escalated:
                         state.advisor_required = True
                         state.advisor_reason = state.advisor_reason or name
             if "advise" in action:
@@ -366,7 +368,7 @@ class Router:
                     closed=True,
                     instructions=[base] if base else [],
                     signals=signals,
-                    rationale={"classifier": "none", "probs": {}, "mode": (self.config.get("decision") or {}).get("mode", "cost"), "required_quality": 0.0},
+                    rationale={"classifier": "none", "probs": {}, "mode": (self.config.get("decision") or {}).get("mode", "cost"), "required_quality": 0.0, "signals_applied": []},
                 )
             state.closed = True
             state.turn += 1
@@ -390,17 +392,23 @@ class Router:
         if instruction:
             state.runtime_instructions.append(instruction)
 
+        escalated_this_turn = False
         current_tier = self.ladder[state.ladder_index][0]
         for sig, floor in FLOOR_SIGNALS.items():
             if signals.get(sig) and TIERS.index(floor) > TIERS.index(current_tier):
                 if self._move(state, self._tier_start(floor), "floor:" + sig):
+                    escalated_this_turn = True
                     current_tier = self.ladder[state.ladder_index][0]
 
         if any(signals.get(s) for s in ESCALATING_SIGNALS):
-            self._move(state, self._escalation_target(state), "signal")
+            if escalated_this_turn:
+                state.advisor_required = True
+                state.advisor_reason = state.advisor_reason or "escalation"
+            else:
+                escalated_this_turn = self._move(state, self._escalation_target(state), "escalation")
 
         applied: List[str] = []
-        self._apply_signal_rules(state, signals, applied)
+        self._apply_signal_rules(state, signals, applied, escalated_this_turn)
         if applied:
             state.signals_applied.extend(applied)
 

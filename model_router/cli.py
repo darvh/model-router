@@ -56,7 +56,12 @@ def _load_dotenv(path: str = ".env") -> None:
                 continue
             key, _sep, value = line.partition("=")
             key = key.strip()
-            value = value.strip().strip('"').strip("'")
+            if key.startswith("export "):
+                key = key[len("export "):].strip()
+            value = value.strip()
+            if " #" in value:
+                value = value.split(" #", 1)[0].rstrip()
+            value = value.strip('"').strip("'")
             if key and key not in os.environ:
                 os.environ[key] = value
 
@@ -71,8 +76,36 @@ def load_config(path: str) -> dict:
 def load_classifier(cache_dir: str):
     path = os.path.join(cache_dir, "classifier.json")
     if os.path.exists(path):
-        return Classifier.load(path)
+        try:
+            return Classifier.load(path)
+        except Exception:
+            return Classifier()  # corrupt classifier: cold heuristic start
     return Classifier()  # heuristic cold start until `calibrate` runs
+
+
+def _parse_signals(items, messages, cfg) -> dict:
+    signals = {}
+    rules = (cfg.get("decision") or {}).get("signal_rules")
+    known = set(FLOOR_SIGNALS) | set(ESCALATING_SIGNALS) | {ADVISOR_SIGNAL, "complete"}
+    known |= set(rules if rules is not None else DEFAULT_SIGNAL_RULES)
+    for item in items or []:
+        name, _sep, raw = item.partition("=")
+        if name not in known:
+            sys.exit("unknown signal: %s (known: %s)" % (name, ", ".join(sorted(known))))
+        if raw:
+            try:
+                signals[name] = float(raw)
+            except ValueError:
+                sys.exit("bad signal value: %s=%s" % (name, raw))
+        else:
+            signals[name] = True
+    if messages:
+        score = frustration_score(messages)
+        if score > 0:
+            previous = signals.get("user_frustration", 0.0)
+            previous = 1.0 if previous is True else float(previous)
+            signals["user_frustration"] = max(previous, score)
+    return signals
 
 
 def make_ref_of(models):
@@ -337,20 +370,7 @@ def cmd_route(args) -> None:
     if not task and not sys.stdin.isatty():
         task = sys.stdin.read()
 
-    signals = {}
-    known = set(FLOOR_SIGNALS) | set(ESCALATING_SIGNALS) | {ADVISOR_SIGNAL, "complete"}
-    known |= set((cfg.get("decision") or {}).get("signal_rules") or DEFAULT_SIGNAL_RULES)
-    for item in args.signal or []:
-        name, _sep, raw = item.partition("=")
-        if name not in known:
-            sys.exit("unknown signal: %s (known: %s)" % (name, ", ".join(sorted(known))))
-        signals[name] = float(raw) if raw else True
-    if args.message:
-        score = frustration_score(args.message)
-        if score > 0:
-            previous = signals.get("user_frustration", 0.0)
-            previous = 1.0 if previous is True else float(previous)
-            signals["user_frustration"] = max(previous, score)
+    signals = _parse_signals(args.signal, args.message, cfg)
     instructions = args.instruction or []
     decision = router.decide(
         args.run_id, task, signals=signals, instruction=instructions[0] if instructions else None

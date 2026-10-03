@@ -43,14 +43,14 @@ def _data_dir(cache_dir: str, version: str) -> str:
 
 def fetch_tasks(cache_dir: str, version: str = DEFAULT_VERSION, force: bool = False) -> List[dict]:
     path = os.path.join(_data_dir(cache_dir, version), "tasks.json")
-    data = fetch_json_cached(tasks_url(version), path, max_age_hours=None, force=force)
-    return data["rows"]
+    data = fetch_json_cached(tasks_url(version), path, max_age_hours=None, force=force) or {}
+    return data.get("rows") or []
 
 
 def fetch_trials(cache_dir: str, version: str = DEFAULT_VERSION, force: bool = False) -> List[dict]:
     path = os.path.join(_data_dir(cache_dir, version), "trials.json")
-    data = fetch_json_cached(trials_url(version), path, max_age_hours=None, force=force)
-    return data["rows"]
+    data = fetch_json_cached(trials_url(version), path, max_age_hours=None, force=force) or {}
+    return data.get("rows") or []
 
 
 def _instruction_from_detail(detail: dict) -> str:

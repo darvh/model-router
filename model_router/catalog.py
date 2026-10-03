@@ -143,13 +143,15 @@ def load_aa_indices(
     try:
         entries: List[dict] = []
         page = 1
-        while page <= 10:
+        while True:
             data = fetch_json_with_key("%s?page=%d" % (AA_URL, page), key)
             entries.extend(data.get("data") or [])
             pagination = data.get("pagination") or {}
             if not pagination.get("has_more"):
                 break
             page += 1
+            if page > 10:
+                raise RuntimeError("AA pagination exceeded 10 pages; refusing to cache partial data")
     except Exception:
         if raise_errors and not cached:
             raise
@@ -192,7 +194,10 @@ AA_QUALITY_FIELDS = ("coding", "agentic", "intelligence")
 
 
 def quality_from_indices(indices: Optional[Dict[str, float]]) -> Optional[float]:
-    """Capability 0..1 from AA index scores (coding > agentic > intelligence)."""
+    """Capability 0..1 from AA index scores (coding > agentic > intelligence).
+
+    AA free-endpoint indices are on a 0..100 scale (median intelligence ~12).
+    """
     if not indices:
         return None
     for field in AA_QUALITY_FIELDS:
@@ -200,10 +205,7 @@ def quality_from_indices(indices: Optional[Dict[str, float]]) -> Optional[float]
             if "cost" in key or "price" in key:
                 continue
             if field in key and isinstance(value, (int, float)) and not isinstance(value, bool):
-                q = float(value)
-                if q > 1.5:  # indices are 0..100; scale to 0..1
-                    q /= 100.0
-                return max(0.0, min(1.0, q))
+                return max(0.0, min(1.0, float(value) / 100.0))
     return None
 
 

@@ -27,8 +27,11 @@ def fetch_json(url: str, timeout: int = 30):
 
 def read_json(path: str):
     if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (ValueError, OSError):
+            return None  # corrupt cache: callers treat as missing and refetch/rebuild
     return None
 
 
