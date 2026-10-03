@@ -43,7 +43,8 @@ Decision shape (trimmed):
   "run_id": "r1", "turn": 2, "tier": "balanced",
   "model": "google/gemini-3.8-flash",
   "advisor": "openai/gpt-5.6-sol",
-  "advisor_required": false, "sticky": true, "escalated": true,
+  "advisor_required": true, "advisor_reason": "escalation",
+  "sticky": true, "escalated": true,
   "escalation_count": 1,
   "instructions": ["...base...", "...tier directive...", "Escalation: utility -> balanced. ..."],
   "rationale": {"classifier": "trained", "probs": {"utility": 0.99, "balanced": 0.01}}
@@ -52,7 +53,9 @@ Decision shape (trimmed):
 
 Signals (mapped from Line's EFFICIENCY.md): `prior_failure`, `verification_divergence`
 (escalate one tier), `not_understood`, `planning_needs_more_tools` (floor at balanced),
-`needs_exploration` (floor at frontier), `needs_advisor`, `complete`.
+`needs_exploration` (floor at frontier), `needs_advisor`, `complete`. Any escalation also
+sets `advisor_required` with `advisor_reason: "escalation"` - failure/divergence routes to
+advisor review, matching Line's playbook.
 
 ## Where the defaults come from
 

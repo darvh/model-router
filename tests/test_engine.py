@@ -57,6 +57,8 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(d2.model, d1.model)
         self.assertTrue(d2.sticky)
         self.assertEqual(d2.turn, 2)
+        self.assertFalse(d2.advisor_required)
+        self.assertEqual(d2.advisor_reason, "")
 
     def test_escalation(self):
         self.router.decide("r2", "x")
@@ -65,6 +67,8 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(d.model, "p/f1")
         self.assertEqual(d.escalation_count, 1)
         self.assertIn("ESC balanced->frontier", d.instructions)
+        self.assertTrue(d.advisor_required)
+        self.assertEqual(d.advisor_reason, "escalation")
 
     def test_floor_signal(self):
         r = Router(CONFIG, make_models(), classifier=StubClassifier("utility"))
@@ -107,6 +111,7 @@ class EngineTests(unittest.TestCase):
         self.router.decide("r7", "x")
         d = self.router.decide("r7", signals={"needs_advisor": True})
         self.assertTrue(d.advisor_required)
+        self.assertEqual(d.advisor_reason, "needs_advisor")
         self.assertTrue(d.advisor)
 
     def test_persistence_across_routers(self):

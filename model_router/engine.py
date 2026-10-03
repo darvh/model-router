@@ -42,6 +42,7 @@ class Decision:
     advisor: str
     advisor_instruction: str
     advisor_required: bool
+    advisor_reason: str
     escalated: bool
     escalation_count: int
     sticky: bool
@@ -62,6 +63,7 @@ class RunState:
     escalated: bool = False
     escalation_count: int = 0
     advisor_required: bool = False
+    advisor_reason: str = ""
     runtime_instructions: List[str] = field(default_factory=list)
     classifier_source: str = "none"
     classifier_probs: Dict[str, float] = field(default_factory=dict)
@@ -176,6 +178,8 @@ class Router:
         state.ladder_index = new_index
         state.escalated = True
         state.escalation_count += 1
+        state.advisor_required = True  # Line: failure/divergence -> advisor review as well
+        state.advisor_reason = "escalation"
         return True
 
     def _snapshot(self, state: RunState, signals: Dict[str, bool]) -> Decision:
@@ -193,6 +197,7 @@ class Router:
             advisor=self._resolve_advisor(tier, model),
             advisor_instruction=instructions.get("advisor", ""),
             advisor_required=state.advisor_required,
+            advisor_reason=state.advisor_reason,
             escalated=state.escalated,
             escalation_count=state.escalation_count,
             sticky=not state.closed,
@@ -260,6 +265,7 @@ class Router:
                     advisor="",
                     advisor_instruction="",
                     advisor_required=False,
+                    advisor_reason="",
                     escalated=False,
                     escalation_count=0,
                     sticky=False,
@@ -296,6 +302,7 @@ class Router:
 
         if signals.get(ADVISOR_SIGNAL):
             state.advisor_required = True
+            state.advisor_reason = state.advisor_reason or "needs_advisor"
 
         state.turn += 1
         self.store.put(state)
